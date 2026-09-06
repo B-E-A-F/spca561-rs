@@ -1,31 +1,11 @@
-# spca561### Modes
-
-Press `0`-`3` while running to switch. All Rev072A modes are raw SGBRG8 Bayer,
-uncompressed:
-
-| Key | Resolution | Approx. fps |
-|-----|------------|-------------|
-| `0` | 352x288    | ~5-10 |
-| `1` | 320x240    | ~7-13 |
-| `2` | 176x144    | ~20-40 |
-| `3` | 160x120    | ~25-50 |
-
-Since the link is bandwidth-limited rather than sensor-limited, a quarter of
-the pixels buys roughly four times the frame rate.
-
-Switching follows the kernel driver's own format-change path: stop streaming
-(`sd_stopN`), then start again with the new mode (`sd_start_72a`). `init()` is
-not repeated, matching `sd_init_72a` being called only at probe. The
-isochronous ring is cancelled and fully drained before it is rebuilt -- freeing
-a transfer while libusb still has a callback pending is undefined behaviour, so
-teardown waits for every transfer to come back, and gives up by leaking rather
-than freeing early.
+# spca561
 
 Userspace capture for the Sunplus **SPCA561A** (Rev072A) USB webcam, USB ID
 `04fc:0561`, with a live preview window.
 
-Target: Windows + WinUSB (bound with [Zadig]) via `rusb`/`libusb`. Nothing here
-is Windows-specific by design, but that is what it has been run on.
+Target: Windows + a userspace USB driver (WinUSB or libusbK, bound with
+[Zadig]) via `rusb`/`libusb`. Nothing here is Windows-specific by design, but
+that is what it has been run on.
 
 [Zadig]: https://zadig.akeo.ie/
 
@@ -40,11 +20,13 @@ is Windows-specific by design, but that is what it has been run on.
 
 [rustup]: https://rustup.rs/
 
-### 2. Bind the camera to WinUSB with Zadig
+### 2. Bind the camera with Zadig
 
 Windows binds this camera to its own USB video class driver, which does not
-expose the raw isochronous endpoint this program needs. Zadig swaps that for
-WinUSB.
+expose the raw isochronous endpoint this program needs. Zadig swaps that for a
+userspace driver -- either **WinUSB** or **libusbK**. Both work with `rusb`;
+which one you want depends on the machine, so read [Which driver](#which-driver)
+below before choosing.
 
 > **Read this first.** Replacing the driver means the camera stops working as a
 > normal webcam in Teams, OBS, Zoom and so on until you revert it. See
@@ -58,13 +40,28 @@ WinUSB.
 4. Pick the camera in the dropdown. **Confirm the USB ID reads `04FC 0561`** in
    the fields under the dropdown -- do not go by name alone. Replacing the
    driver on the wrong device (a mouse, a keyboard, a hub) will disable it.
-5. Set the target driver on the right of the green arrow to **WinUSB**.
+5. Set the target driver on the right of the green arrow to **WinUSB**, or to
+   **libusbK** -- see below.
 6. Click **Replace Driver**, and wait. It can sit there for 30 seconds or so.
 7. When it reports success, unplug the camera and plug it back in.
 
 If the device has several interfaces listed, choose the one carrying the
 isochronous video endpoint. The program prints which endpoint and alternate
 setting it selected at startup, so it will tell you if you picked wrong.
+
+#### Which driver
+
+**WinUSB** is Microsoft's in-box driver and the obvious first choice. Its
+isochronous support, though, is a Windows 8.1-era API that does not work
+everywhere -- and when it fails it fails completely, rejecting every transfer
+the instant it is submitted while control transfers carry on working perfectly.
+
+**libusbK** ships its own driver with an older, more permissive isochronous
+path. If WinUSB gives you no data, rebind to libusbK. Nothing in this program
+changes; `rusb` picks it up transparently.
+
+Rebinding between the two is just step 2 again with a different selection in
+the dropdown.
 
 ### 3. Run
 
@@ -86,20 +83,23 @@ scaled up into it.
 At startup it prints the endpoint it chose, then a frame rate once a second:
 
 ```
-using alt 1, ep 0x81, 1023 bytes/packet
+using alt 7, ep 0x81, 1023 bytes/packet
 streaming, Esc or close the window to stop
 5 fps
 5 fps
 ```
 
+The alternate setting number varies between devices -- it picks the isochronous
+IN endpoint with the largest packet size, whichever alt that is.
+
 If the frame rate sits at `0 fps` while the program is otherwise running, see
-the initialisation note below.
+[Troubleshooting](#troubleshooting).
 
 ## Troubleshooting
 
 **`device 04fc:0561 not found. Did you bind WinUSB with Zadig?`**
-The camera is not bound to WinUSB. Redo step 2, making sure **List All Devices**
-is ticked and Zadig is elevated.
+The camera is not bound to WinUSB or libusbK. Redo step 2, making sure
+**List All Devices** is ticked and Zadig is elevated.
 
 **`isochronous submit failed` / `LIBUSB_ERROR_NOT_SUPPORTED` (-12)**
 WinUSB isochronous transfer needs Windows 8.1 or newer.
@@ -109,15 +109,40 @@ A mode switch could not get its transfers back from libusb within two seconds,
 so the ring was leaked rather than freed underneath it and the program stopped.
 This should not happen; please report it with the mode you switched from and to.
 
-**The preview is frozen but there is no error.**
-See the note on `init()` below -- that is the exact signature of the bridge
-never being told its frame geometry.
+**`0 fps`, or a frozen preview with no error at all.**
+Two unrelated faults produce exactly this, and nothing in the normal output
+separates them: in one, no packet ever arrives; in the other, packets arrive but
+never delimit into a frame. Work through them in this order.
+
+1. **The driver's isochronous path.** Rebind with Zadig and choose **libusbK**
+   instead of WinUSB, then re-run. If that fixes it, WinUSB had been rejecting
+   every transfer the moment it was submitted.
+
+   libusb carries two separate isochronous implementations and picks between
+   them by bound driver -- the `SUB_API_LIBUSBK` / `SUB_API_WINUSB` branch in
+   the submit path of `windows_winusb.c`. libusbK submits a single
+   `IsoReadPipe()` with an explicit start frame. WinUSB instead pairs
+   `RegisterIsochBuffer()` with `ReadIsochPipeAsap()`, which schedules "as soon
+   as possible" and has to establish a continuing stream; where it cannot, it
+   fails the request outright rather than degrading. Control transfers are
+   untouched by any of this, which is what makes the symptom so misleading:
+   every register write succeeds, the device sits healthy in Device Manager, and
+   the program looks like it is running normally.
+
+   Seen on an Intel xHCI root port with the camera attached directly: WinUSB
+   rejected every transfer at every alternate setting, from 128 up to 1023 bytes
+   per packet, while libusbK worked immediately on the same port.
+
+2. **Frame geometry.** If libusbK changes nothing, packets are most likely
+   arriving and failing to delimit, which is the signature of `init()` not
+   having run. See [the note below](#the-bridge-needs-initialising-before-it-will-delimit-frames).
 
 ## Reverting
 
 To give the camera back to Windows: Device Manager -> find the device ->
 **Uninstall device**, tick *Delete the driver software for this device*, then
-unplug and replug. Windows reinstalls its own driver.
+unplug and replug. Windows reinstalls its own driver. This is the same whether
+you bound WinUSB or libusbK.
 
 ## Notes
 
