@@ -76,6 +76,7 @@ A window opens with the live feed.
 | `0`-`3` | Switch capture mode (see [Modes](#modes)) |
 | `4` | Toggle frame interpolation (see [Mode 4](#mode-4-frame-interpolation)) |
 | `5` | Switch demosaic (see [Demosaic](#demosaic)) |
+| `A` | Toggle autogain (see [Exposure](#exposure)) |
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
 
@@ -94,13 +95,14 @@ streaming, Esc or close the window to stop
 The alternate setting number varies between devices -- it picks the isochronous
 IN endpoint with the largest packet size, whichever alt that is.
 
-Three environment variables set the startup state, which saves clicking the
-window before pressing a key, and makes the thing scriptable:
+Environment variables set the startup state, which saves clicking the window
+before pressing a key, and makes the thing scriptable:
 
 | Variable | Effect |
 |----------|--------|
 | `SPCA_MODE` | Initial capture mode, `0`-`3` |
 | `SPCA_INTERP` | `1` to start with interpolation already on |
+| `SPCA_AUTOGAIN` | `0` to start with autogain off |
 | `SPCA_DEMOSAIC` | `bilinear` (default) or `block` |
 | `SPCA_SHOT` | Capture this many frames to PPM, then exit |
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
@@ -187,6 +189,39 @@ isochronous ring is cancelled and fully drained before being rebuilt -- freeing
 a transfer while libusb still has a callback pending is undefined behaviour, so
 teardown waits for every transfer to come back, and on timeout leaks the ring
 rather than freeing memory libusb may still write to.
+
+### Exposure
+
+The sensor powers up badly underexposed indoors and nothing in `init()` or
+`start()` corrects it -- the kernel driver leans entirely on its autogain loop
+to find a working exposure, so this does too. It is on by default. `A` toggles
+it, `SPCA_AUTOGAIN=0` starts with it off.
+
+The bridge accumulates per-channel luminance in `0x8621`-`0x8624`. Each pass
+weights those into a luma, and if it is more than 20 away from a target of 110,
+nudges the sensor's exposure (i2c `0x09`) and gain (i2c `0x35`) towards it.
+That is `do_autogain()` from `spca561.c`, and the constants are the kernel's.
+
+Measured on this camera, mode 0: mean frame luma goes from about 21 to about
+78 and settles there in roughly ten seconds. The metering is whole-scene, so a
+bright window in shot will blow out -- the same trade the kernel driver makes.
+
+Two deliberate departures from the kernel:
+
+- **Passes are paced every 5 captured frames, not 13.** The kernel runs per
+  frame against a driver doing 25-30 fps; at 5 fps in mode 0 its pacing is a
+  pass every 2.6 seconds. Each pass costs a handful of control transfers that
+  share the link with the isochronous stream, so 5 is a compromise rather than
+  "every frame".
+- **The damping loosens while far from target.** The kernel's fixed shift of 4
+  is tuned for gentle adaptation from an already-reasonable exposure. From this
+  sensor's power-up state it steps by 5 against a range running to 0x256, which
+  takes minutes to arrive. Halving the damping outside twice the tolerance
+  converges in seconds, and it is restored near the target so the loop settles
+  rather than hunting.
+
+Autogain runs from the window loop rather than the USB callback: it makes
+blocking control transfers, and stalling `xfer_cb` would starve the ring.
 
 ### Demosaic
 

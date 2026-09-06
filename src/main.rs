@@ -65,6 +65,23 @@ const PKTS_PER_XFER: usize = 8;
 /// Cap on how often the message queue is pumped when no new frame arrived.
 const IDLE_PUMP: Duration = Duration::from_millis(16);
 
+// Autogain, transposed from do_autogain() in spca561.c. The sensor powers up
+// badly underexposed indoors, and nothing in init() or start() corrects it --
+// the kernel driver leans entirely on this loop to find a working exposure.
+/// Captured frames between autogain passes. The kernel uses 13, against a
+/// driver that runs this per frame at 25-30 fps; at 5 fps in mode 0 that is a
+/// pass every 2.6 seconds, which is too sparse to converge in reasonable time.
+/// Each pass costs a handful of control transfers, and those share a link with
+/// the isochronous stream, so this is a compromise rather than "every frame".
+const AG_EVERY: u32 = 5;
+/// Luma the loop steers towards, and how far off it tolerates before acting.
+const AG_TARGET: i32 = 110;
+const AG_DELTA: i32 = 20;
+/// Shift damping the exposure correction. Undamped, this oscillates.
+const AG_SPRING: i32 = 4;
+/// Pixel clock bits ORed into the exposure register alongside the time.
+const AG_PIXELCLK: u16 = 0x0800;
+
 // ---------------------------------------------------------------------------
 // Init tables, verbatim from spca561.c
 //
@@ -246,6 +263,99 @@ impl Cam {
         self.set_white(0x20, 0x20);
 
         self.reg_w(0x8112, 0x10 | 0x20); // go
+    }
+
+    /// Read a 16-bit sensor register over the bridge's I2C bridge.
+    ///
+    /// Mirrors the kernel's i2c_read. The byte order matches i2c_write above:
+    /// 0x8800 carries the high byte, 0x8805 the low one. Verified against a
+    /// value we had just written -- see `report_sensor`.
+    fn i2c_read(&self, reg: u16, mode: u8) -> Option<u16> {
+        self.reg_w(0x8804, 0x92);
+        self.reg_w(0x8801, reg as u8);
+        self.reg_w(0x8802, mode | 0x01);
+
+        let mut b = [0u8; 1];
+        for _ in 0..60 {
+            if self.reg_r(0x8803, &mut b) && b[0] == 0 {
+                let mut hi = [0u8; 1];
+                let mut lo = [0u8; 1];
+                if self.reg_r(0x8800, &mut hi) && self.reg_r(0x8805, &mut lo) {
+                    return Some(((hi[0] as u16) << 8) | lo[0] as u16);
+                }
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// Print what the sensor reports as its exposure and gain.
+    ///
+    /// Worth knowing: straight after start() this reads back the values from
+    /// REV72A_INIT_SENSOR1 (0x1049, 0x0010), not the REV72A_INIT_SENSOR2 ones
+    /// (0x1061, 0x0014) written later in the same sequence. The reads are
+    /// sound -- they return distinct, exact values from our own tables, and
+    /// autogain demonstrably converges on top of them -- so something between
+    /// the second sensor vector and the streaming enable is putting 0x09 and
+    /// 0x35 back. Unexplained rather than harmful; autogain overwrites both
+    /// within a second anyway.
+    fn report_sensor(&self) {
+        match (self.i2c_read(0x09, 0x10), self.i2c_read(0x35, 0x10)) {
+            (Some(e), Some(g)) => println!("sensor: exposure 0x{e:04x}, gain 0x{g:04x}"),
+            _ => eprintln!("sensor: could not read exposure/gain over i2c"),
+        }
+    }
+
+    /// One pass of the kernel driver's do_autogain for Rev072A.
+    ///
+    /// The bridge accumulates per-channel luminance in 0x8621-0x8624; this
+    /// weights them to a luma, and nudges sensor exposure and gain until that
+    /// sits near the target. Returns the new (exposure, gain) when it acted.
+    ///
+    /// Constants are the kernel's: target 110, tolerance 20, and a spring of
+    /// 4, which is the shift that damps the exposure correction. Without the
+    /// damping this oscillates instead of settling.
+    fn autogain(&self) -> Option<(u16, u16)> {
+        let mut b = [0u8; 1];
+        let mut read = |i: u16| -> Option<i32> {
+            if self.reg_r(i, &mut b) {
+                Some(b[0] as i32)
+            } else {
+                None
+            }
+        };
+        let gr = read(0x8621)?;
+        let r = read(0x8622)?;
+        let bl = read(0x8623)?;
+        let gb = read(0x8624)?;
+
+        let y = (77 * r + 75 * (gr + gb) + 29 * bl) >> 8;
+        if (y - AG_TARGET).abs() <= AG_DELTA {
+            return None;
+        }
+
+        let expo = (self.i2c_read(0x09, 0x10)? & 0x07ff) as i32;
+        let gain = self.i2c_read(0x35, 0x10)? as i32;
+
+        // The kernel's fixed shift of 4 is tuned for gentle adaptation from an
+        // already-reasonable exposure. This sensor powers up far darker than
+        // that, and from there a step of (110-20)>>4 = 5, against a range that
+        // runs to 0x256, takes minutes to arrive. Loosen the damping while far
+        // from target and restore it once close, so it converges quickly and
+        // still settles instead of hunting around the target.
+        let err = AG_TARGET - y;
+        let spring = if err.abs() > 2 * AG_DELTA { AG_SPRING - 2 } else { AG_SPRING };
+
+        // Clamps are the kernel's. Exposure above 0x256 starts halving the
+        // frame rate to buy integration time, which is not a trade worth
+        // making on a link already this slow.
+        let gain = (gain + err / 50).clamp(3, 0x3f);
+        let expo = (expo + (err >> spring)).clamp(3, 0x0256);
+
+        self.i2c_write(gain as u16, 0x35);
+        self.i2c_write(expo as u16 | AG_PIXELCLK, 0x09);
+        Some((expo as u16, gain as u16))
     }
 
     fn stop(&self) {
@@ -1167,6 +1277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     cam.start(mode);
+    cam.report_sensor();
 
     // Deliberately leaked: xfer_cb holds a raw pointer to it for the life of
     // the process. Accessed ONLY through this raw pointer, never through a
@@ -1192,6 +1303,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write each scripted shot through both demosaics instead of the selected
     // one, so they can be compared on identical sensor data.
     let shot_ab = std::env::var("SPCA_SHOT_AB").as_deref() == Ok("1");
+
+    // On by default, as it is in the kernel driver: the sensor powers up
+    // heavily underexposed indoors and nothing else ever corrects it.
+    let mut autogain_on = std::env::var("SPCA_AUTOGAIN").as_deref() != Ok("0");
+    let mut last_ag_seq = 0u64;
+    println!("autogain {}", if autogain_on { "on" } else { "off" });
     let mut shots_taken = 0u32;
     let mut last_shot_seq = 0u64;
     /// Frames to discard before a scripted shot, so automatic gain and
@@ -1283,6 +1400,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("frame interpolation {}", if interp_on { "on" } else { "off" });
         }
 
+        // Autogain. Paced off captured frames rather than wall clock, matching
+        // the kernel's per-frame countdown, and run here rather than in the
+        // USB callback: it costs a handful of blocking control transfers, and
+        // stalling xfer_cb would starve the isochronous ring.
+        if autogain_on {
+            let seq = unsafe { (*state).seq };
+            if seq >= last_ag_seq + AG_EVERY as u64 {
+                last_ag_seq = seq;
+                cam.autogain();
+            }
+        }
+
         // Scripted capture. Deliberately driven from the window loop rather
         // than the USB callback, so writing a file cannot stall event handling
         // and starve the isochronous ring.
@@ -1299,6 +1428,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if shots_taken >= shots {
                     break;
                 }
+            }
+        }
+
+        if window.is_key_pressed(Key::A, KeyRepeat::No) {
+            autogain_on = !autogain_on;
+            println!("autogain {}", if autogain_on { "on" } else { "off" });
+            if autogain_on {
+                last_ag_seq = unsafe { (*state).seq };
             }
         }
 
