@@ -1,2 +1,5 @@
 /target
 frame_*.ppm
+# written by older builds that carried the capture diagnostics
+diag.log
+trace.log

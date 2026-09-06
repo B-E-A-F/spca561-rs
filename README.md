@@ -1,4 +1,25 @@
-# spca561
+# spca561### Modes
+
+Press `0`-`3` while running to switch. All Rev072A modes are raw SGBRG8 Bayer,
+uncompressed:
+
+| Key | Resolution | Approx. fps |
+|-----|------------|-------------|
+| `0` | 352x288    | ~5-10 |
+| `1` | 320x240    | ~7-13 |
+| `2` | 176x144    | ~20-40 |
+| `3` | 160x120    | ~25-50 |
+
+Since the link is bandwidth-limited rather than sensor-limited, a quarter of
+the pixels buys roughly four times the frame rate.
+
+Switching follows the kernel driver's own format-change path: stop streaming
+(`sd_stopN`), then start again with the new mode (`sd_start_72a`). `init()` is
+not repeated, matching `sd_init_72a` being called only at probe. The
+isochronous ring is cancelled and fully drained before it is rebuilt -- freeing
+a transfer while libusb still has a callback pending is undefined behaviour, so
+teardown waits for every transfer to come back, and gives up by leaking rather
+than freeing early.
 
 Userspace capture for the Sunplus **SPCA561A** (Rev072A) USB webcam, USB ID
 `04fc:0561`, with a live preview window.
@@ -51,8 +72,16 @@ setting it selected at startup, so it will tell you if you picked wrong.
 cargo run --release
 ```
 
-A window opens with the live feed. **Esc** quits, **S** writes the current frame
-to `frame_NNNN.ppm` in the working directory.
+A window opens with the live feed.
+
+| Key | Action |
+|-----|--------|
+| `0`-`3` | Switch capture mode (see [Modes](#modes)) |
+| `S` | Write the current frame to `frame_NNNN.ppm` |
+| `Esc` | Quit |
+
+The window is sized for the largest mode and stays that size; smaller modes are
+scaled up into it.
 
 At startup it prints the endpoint it chose, then a frame rate once a second:
 
@@ -75,6 +104,11 @@ is ticked and Zadig is elevated.
 **`isochronous submit failed` / `LIBUSB_ERROR_NOT_SUPPORTED` (-12)**
 WinUSB isochronous transfer needs Windows 8.1 or newer.
 
+**`timed out reclaiming N isochronous transfers`**
+A mode switch could not get its transfers back from libusb within two seconds,
+so the ring was leaked rather than freed underneath it and the program stopped.
+This should not happen; please report it with the mode you switched from and to.
+
 **The preview is frozen but there is no error.**
 See the note on `init()` below -- that is the exact signature of the bridge
 never being told its frame geometry.
@@ -92,15 +126,28 @@ The camera is USB 1.1 full speed, so isochronous transfer caps at 1023 bytes per
 or roughly 5-10 fps. That is a bandwidth ceiling, not a software limit; drop to
 a smaller mode for a faster feed.
 
-`MODE`, `WIDTH` and `HEIGHT` are separate constants and must be changed
-together. Rev072A modes are all raw SGBRG8 Bayer, uncompressed:
+### Modes
 
-| MODE | Resolution |
-|------|------------|
-| 0    | 352x288    |
-| 1    | 320x240    |
-| 2    | 176x144    |
-| 3    | 160x120    |
+Press `0`-`3` while running to switch. All Rev072A modes are raw SGBRG8 Bayer,
+uncompressed:
+
+| Key | Resolution | Approx. fps |
+|-----|------------|-------------|
+| `0` | 352x288    | ~5-10       |
+| `1` | 320x240    | ~7-13       |
+| `2` | 176x144    | ~20-40      |
+| `3` | 160x120    | ~25-50      |
+
+The link is bandwidth-limited rather than sensor-limited, so a quarter of the
+pixels buys roughly four times the frame rate.
+
+Switching follows the kernel driver's own format-change path: stop streaming
+(`sd_stopN`), then start again with the new mode (`sd_start_72a`). `init()` is
+not repeated, matching `sd_init_72a` being called only at probe. The
+isochronous ring is cancelled and fully drained before being rebuilt -- freeing
+a transfer while libusb still has a callback pending is undefined behaviour, so
+teardown waits for every transfer to come back, and on timeout leaks the ring
+rather than freeing memory libusb may still write to.
 
 Debayering is deliberately crude -- nearest-neighbour on 2x2 GBRG blocks -- so
 expect colour fringing on edges.
