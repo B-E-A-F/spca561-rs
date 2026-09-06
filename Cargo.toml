@@ -1,0 +1,22 @@
+[package]
+name = "spca561"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Userspace capture for the Sunplus SPCA561A (Rev072A) USB webcam, 04fc:0561, with a live preview window"
+repository = "https://github.com/B-E-A-F/spca561-rs"
+readme = "README.md"
+
+[dependencies]
+# rusb vendors and builds libusb itself on Windows/MSVC, so no MSYS2 needed.
+rusb = "0.9"
+# Raw FFI, needed only because rusb has no safe isochronous API.
+# This version MUST match the libusb1-sys that rusb pulls in, or you
+# will link two copies of libusb and the handles won't be compatible.
+# Check with: cargo tree -i libusb1-sys
+libusb1-sys = "0.7"
+# libusb1-sys imports `timeval` from libc privately, so it isn't re-exported.
+# Same 0.2.x crate instance cargo already unifies for libusb1-sys, so the
+# struct is literally the same type its FFI signatures expect.
+libc = "0.2"
+minifb = "0.28.0"

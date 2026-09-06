@@ -1,0 +1,4 @@
+/target
+diag.log
+trace.log
+frame_*.ppm
