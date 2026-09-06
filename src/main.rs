@@ -254,6 +254,114 @@ impl Cam {
 }
 
 // ---------------------------------------------------------------------------
+// Demosaic.
+//
+// The sensor is SGBRG8, one measured channel per pixel:
+//
+//   even row:  G B G B
+//   odd  row:  R G R G
+//
+// so two of every three channels have to be reconstructed from neighbours.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Demosaic {
+    /// The original: one R, G and B sampled per 2x2 block and shared across
+    /// all four pixels. Kept for comparison, because it is the cheapest thing
+    /// that works and it is what every earlier capture used.
+    Block,
+    /// Per-pixel bilinear reconstruction.
+    Bilinear,
+}
+
+/// Write a 0RGB buffer as a binary PPM. Returns whether it landed.
+fn write_ppm(name: &str, rgb: &[u32], w: usize, h: usize) -> bool {
+    use std::io::Write;
+    let mut out = Vec::with_capacity(w * h * 3);
+    for px in rgb {
+        out.push((px >> 16) as u8);
+        out.push((px >> 8) as u8);
+        out.push(*px as u8);
+    }
+    match std::fs::File::create(name) {
+        Ok(mut f) => {
+            let _ = write!(f, "P6\n{w} {h}\n255\n");
+            let _ = f.write_all(&out);
+            println!("wrote {name}");
+            true
+        }
+        Err(e) => {
+            eprintln!("could not write {name}: {e}");
+            false
+        }
+    }
+}
+
+/// One R, G and B per 2x2 block, shared by all four pixels.
+///
+/// Cheap, but it throws away half the spatial detail the sensor recorded:
+/// a 352x288 frame carries only 176x144 distinct colour samples, and edges
+/// pick up the colour fringing that follows from four pixels sharing one
+/// measurement.
+fn demosaic_block(buf: &[u8], rgb: &mut [u32], w: usize, h: usize) {
+    for y in 0..h {
+        let yc = y & !1;
+        for x in 0..w {
+            let xc = x & !1;
+            let g = buf[yc * w + xc] as u32;
+            let b = buf[yc * w + xc + 1] as u32;
+            let r = buf[(yc + 1) * w + xc] as u32;
+            rgb[y * w + x] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+/// Bilinear reconstruction: every pixel keeps its own measurement and
+/// interpolates the two it lacks from the neighbours that carry them.
+///
+/// Which neighbours those are depends on the site. At a red or blue site the
+/// four orthogonal neighbours are all green and the four diagonal ones are all
+/// the remaining colour. At a green site the two horizontal neighbours carry
+/// one colour and the two vertical ones the other, and which is which flips
+/// between rows -- hence the four cases rather than two.
+fn demosaic_bilinear(buf: &[u8], rgb: &mut [u32], w: usize, h: usize) {
+    let at = |x: isize, y: isize| -> u32 {
+        let xc = x.clamp(0, w as isize - 1) as usize;
+        let yc = y.clamp(0, h as isize - 1) as usize;
+        buf[yc * w + xc] as u32
+    };
+
+    for y in 0..h {
+        for x in 0..w {
+            let (xi, yi) = (x as isize, y as isize);
+            let c = at(xi, yi);
+
+            let horz = (at(xi - 1, yi) + at(xi + 1, yi) + 1) / 2;
+            let vert = (at(xi, yi - 1) + at(xi, yi + 1) + 1) / 2;
+            let orth = (at(xi - 1, yi) + at(xi + 1, yi) + at(xi, yi - 1) + at(xi, yi + 1) + 2) / 4;
+            let diag = (at(xi - 1, yi - 1)
+                + at(xi + 1, yi - 1)
+                + at(xi - 1, yi + 1)
+                + at(xi + 1, yi + 1)
+                + 2)
+                / 4;
+
+            let (r, g, b) = match (y & 1, x & 1) {
+                // Green on a blue row: blue left and right, red above and below.
+                (0, 0) => (vert, c, horz),
+                // Blue site.
+                (0, 1) => (diag, orth, c),
+                // Red site.
+                (1, 0) => (c, orth, diag),
+                // Green on a red row: red left and right, blue above and below.
+                _ => (horz, c, vert),
+            };
+            rgb[y * w + x] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frame assembly.
 // Each isoc packet starts with a 1-byte sequence number:
 //   0x00 -> start of frame, then a 16-byte header to skip (Rev072A)
@@ -271,6 +379,9 @@ struct FrameState {
     /// Debayered frame in minifb's 0RGB layout. Reused between frames;
     /// reallocated only when the mode changes.
     rgb: Vec<u32>,
+    /// Which reconstruction emit() uses. Switchable at runtime so the two can
+    /// be compared on the same scene rather than from memory.
+    demosaic: Demosaic,
     /// Bumped by emit(). The window loop redraws only when this changes.
     seq: u64,
     /// The frame before `rgb`. Mode 4 interpolates from it towards `rgb`;
@@ -302,6 +413,7 @@ impl FrameState {
             valid: false,
             count: 0,
             rgb: vec![0u32; mode.frame_sz()],
+            demosaic: Demosaic::Bilinear,
             seq: 0,
             prev_rgb: vec![0u32; mode.frame_sz()],
             have_prev: false,
@@ -378,18 +490,10 @@ impl FrameState {
         std::mem::swap(&mut self.rgb, &mut self.prev_rgb);
         self.have_prev = self.since_mode >= 1;
 
-        // Nearest-neighbour GBRG debayer on 2x2 blocks. Crude on purpose.
-        // GBRG: row0 = G B G B, row1 = R G R G
         let (w, h) = (self.mode.w, self.mode.h);
-        for y in 0..h {
-            let yc = y & !1;
-            for x in 0..w {
-                let xc = x & !1;
-                let g = self.buf[yc * w + xc] as u32;
-                let b = self.buf[yc * w + xc + 1] as u32;
-                let r = self.buf[(yc + 1) * w + xc] as u32;
-                self.rgb[y * w + x] = (r << 16) | (g << 8) | b;
-            }
+        match self.demosaic {
+            Demosaic::Block => demosaic_block(&self.buf, &mut self.rgb, w, h),
+            Demosaic::Bilinear => demosaic_bilinear(&self.buf, &mut self.rgb, w, h),
         }
 
         // Measure the real frame interval so interpolation can place itself on
@@ -410,23 +514,28 @@ impl FrameState {
     /// whatever mode 4 last composed: an interpolated frame is invented, and
     /// a saved still should be something the sensor actually saw.
     fn save_ppm(&mut self) {
-        use std::io::Write;
         let name = format!("frame_{:04}.ppm", self.count);
-        let mut out = Vec::with_capacity(self.mode.frame_sz() * 3);
-        for px in &self.rgb {
-            out.push((px >> 16) as u8);
-            out.push((px >> 8) as u8);
-            out.push(*px as u8);
+        if write_ppm(&name, &self.rgb, self.mode.w, self.mode.h) {
+            self.count += 1;
         }
-        match std::fs::File::create(&name) {
-            Ok(mut f) => {
-                let _ = write!(f, "P6\n{} {}\n255\n", self.mode.w, self.mode.h);
-                let _ = f.write_all(&out);
-                println!("wrote {name}");
-                self.count += 1;
-            }
-            Err(e) => eprintln!("could not write {name}: {e}"),
+    }
+
+    /// Write the same raw frame through both demosaics.
+    ///
+    /// The only honest way to compare them: capturing twice and switching in
+    /// between compares two moments of a moving scene, not two algorithms.
+    fn save_ab(&mut self) {
+        let (w, h) = (self.mode.w, self.mode.h);
+        let mut tmp = vec![0u32; w * h];
+        let passes: [(&str, fn(&[u8], &mut [u32], usize, usize)); 2] = [
+            ("block", demosaic_block),
+            ("bilinear", demosaic_bilinear),
+        ];
+        for (label, f) in passes {
+            f(&self.buf, &mut tmp, w, h);
+            write_ppm(&format!("frame_{:04}_{label}.ppm", self.count), &tmp, w, h);
         }
+        self.count += 1;
     }
 }
 
@@ -1066,6 +1175,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // aliased, and its noalias would let the compiler hoist reads of .seq out
     // of the render loop and freeze the picture.
     let state: *mut FrameState = Box::leak(Box::new(FrameState::new(mode)));
+    if let Ok(v) = std::env::var("SPCA_DEMOSAIC") {
+        match v.trim() {
+            "block" => unsafe { (*state).demosaic = Demosaic::Block },
+            "bilinear" => unsafe { (*state).demosaic = Demosaic::Bilinear },
+            other => eprintln!("SPCA_DEMOSAIC must be block or bilinear, ignoring {other:?}"),
+        }
+    }
+
+    // Capture N frames to PPM and exit, for scripted comparisons where there
+    // is no window to press S in.
+    let shots: u32 = std::env::var("SPCA_SHOT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    // Write each scripted shot through both demosaics instead of the selected
+    // one, so they can be compared on identical sensor data.
+    let shot_ab = std::env::var("SPCA_SHOT_AB").as_deref() == Ok("1");
+    let mut shots_taken = 0u32;
+    let mut last_shot_seq = 0u64;
+    /// Frames to discard before a scripted shot, so automatic gain and
+    /// exposure have settled rather than capturing the first dark frames.
+    const SETTLE: u64 = 15;
 
     let mut ring = unsafe { build_ring(cam.handle.as_raw(), ep_addr, best, state)? };
 
@@ -1150,6 +1281,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if window.is_key_pressed(Key::Key4, KeyRepeat::No) {
             interp_on = !interp_on;
             println!("frame interpolation {}", if interp_on { "on" } else { "off" });
+        }
+
+        // Scripted capture. Deliberately driven from the window loop rather
+        // than the USB callback, so writing a file cannot stall event handling
+        // and starve the isochronous ring.
+        if shots > 0 {
+            let s = unsafe { &*state };
+            if s.seq >= SETTLE && s.seq != last_shot_seq {
+                last_shot_seq = s.seq;
+                if shot_ab {
+                    unsafe { (*state).save_ab() };
+                } else {
+                    unsafe { (*state).save_ppm() };
+                }
+                shots_taken += 1;
+                if shots_taken >= shots {
+                    break;
+                }
+            }
+        }
+
+        // Demosaic A/B. Takes effect on the next captured frame, so at low
+        // frame rates expect to wait a moment to see it.
+        if window.is_key_pressed(Key::Key5, KeyRepeat::No) {
+            let next = match unsafe { (*state).demosaic } {
+                Demosaic::Block => Demosaic::Bilinear,
+                Demosaic::Bilinear => Demosaic::Block,
+            };
+            unsafe { (*state).demosaic = next };
+            println!(
+                "demosaic: {}",
+                match next {
+                    Demosaic::Block => "2x2 block",
+                    Demosaic::Bilinear => "bilinear",
+                }
+            );
         }
 
         // Mode switch. The kernel driver changes format the same way: stop

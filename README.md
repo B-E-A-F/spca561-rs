@@ -75,6 +75,7 @@ A window opens with the live feed.
 |-----|--------|
 | `0`-`3` | Switch capture mode (see [Modes](#modes)) |
 | `4` | Toggle frame interpolation (see [Mode 4](#mode-4-frame-interpolation)) |
+| `5` | Switch demosaic (see [Demosaic](#demosaic)) |
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
 
@@ -100,6 +101,9 @@ window before pressing a key, and makes the thing scriptable:
 |----------|--------|
 | `SPCA_MODE` | Initial capture mode, `0`-`3` |
 | `SPCA_INTERP` | `1` to start with interpolation already on |
+| `SPCA_DEMOSAIC` | `bilinear` (default) or `block` |
+| `SPCA_SHOT` | Capture this many frames to PPM, then exit |
+| `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
 | `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
@@ -184,8 +188,41 @@ a transfer while libusb still has a callback pending is undefined behaviour, so
 teardown waits for every transfer to come back, and on timeout leaks the ring
 rather than freeing memory libusb may still write to.
 
-Debayering is deliberately crude -- nearest-neighbour on 2x2 GBRG blocks -- so
-expect colour fringing on edges.
+### Demosaic
+
+The sensor is SGBRG8, one measured channel per pixel:
+
+```
+even row:  G B G B
+odd  row:  R G R G
+```
+
+so two channels in three have to be reconstructed. `5` switches between the
+two reconstructions at runtime.
+
+**Bilinear** is the default. Each pixel keeps its own measurement and
+interpolates the two it lacks from the neighbours that carry them.
+
+**2x2 block** samples one R, G and B per 2x2 block and shares them across all
+four pixels. It is what this program originally did, kept because it is the
+cheapest thing that works and because every capture before it existed used it.
+
+It is worth understanding what the block version costs, because it is more than
+it looks. Sharing one measurement across four pixels means a 352x288 frame
+carries only 176x144 distinct colour samples -- half the spatial detail the
+sensor actually recorded is discarded before anything else happens. High
+contrast edges pick up visible stair-stepping and red/green fringing as a
+direct result.
+
+To compare them honestly, capture both from one raw frame:
+
+```
+SPCA_SHOT=1 SPCA_SHOT_AB=1 cargo run --release
+```
+
+That writes `frame_NNNN_block.ppm` and `frame_NNNN_bilinear.ppm` from the same
+sensor data. Switching demosaic between two live captures compares two moments
+of a moving scene rather than two algorithms.
 
 ### Mode 4: frame interpolation
 
