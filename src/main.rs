@@ -175,6 +175,22 @@ struct Cam {
 }
 
 impl Cam {
+    /// Wait, while still servicing the isochronous ring.
+    ///
+    /// The i2c handshakes below poll with a delay between attempts, and
+    /// autogain runs them from the window loop while streaming. A plain sleep
+    /// there stalls libusb event handling for its whole duration: completed
+    /// transfers go unreaped, the ring runs dry, and the frame rate visibly
+    /// drops every time autogain acts. Pumping events waits just as long and
+    /// keeps the ring fed. Harmless before streaming starts, when there is
+    /// simply nothing to reap.
+    fn settle(&self, ms: i32) {
+        let tv = timeval { tv_sec: 0, tv_usec: ms * 1000 };
+        unsafe {
+            ffi::libusb_handle_events_timeout(self.handle.context().as_raw(), &tv);
+        }
+    }
+
     fn reg_w(&self, index: u16, value: u8) {
         let r = self.handle.write_control(
             0x40, // OUT | VENDOR | DEVICE
@@ -211,7 +227,7 @@ impl Cam {
             if self.reg_r(0x8803, &mut b) && b[0] == 0 {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            self.settle(10);
         }
         eprintln!("i2c_write reg 0x{reg:02x} timed out");
     }
@@ -285,7 +301,7 @@ impl Cam {
                 }
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            self.settle(10);
         }
         None
     }
@@ -316,7 +332,7 @@ impl Cam {
     /// Constants are the kernel's: target 110, tolerance 20, and a spring of
     /// 4, which is the shift that damps the exposure correction. Without the
     /// damping this oscillates instead of settling.
-    fn autogain(&self) -> Option<(u16, u16)> {
+    fn autogain(&self, max_expo: i32) -> Option<(u16, u16)> {
         let mut b = [0u8; 1];
         let mut read = |i: u16| -> Option<i32> {
             if self.reg_r(i, &mut b) {
@@ -347,11 +363,13 @@ impl Cam {
         let err = AG_TARGET - y;
         let spring = if err.abs() > 2 * AG_DELTA { AG_SPRING - 2 } else { AG_SPRING };
 
-        // Clamps are the kernel's. Exposure above 0x256 starts halving the
-        // frame rate to buy integration time, which is not a trade worth
-        // making on a link already this slow.
+        // Exposure and frame rate are the same knob on this sensor: longer
+        // integration is bought by slowing the frame clock. Measured in mode
+        // 3, letting this run to the kernel's 0x256 ceiling takes capture from
+        // 27 fps down to 14 as it brightens. That is a real trade, not
+        // overhead, so the ceiling is caller's choice.
         let gain = (gain + err / 50).clamp(3, 0x3f);
-        let expo = (expo + (err >> spring)).clamp(3, 0x0256);
+        let expo = (expo + (err >> spring)).clamp(3, max_expo);
 
         self.i2c_write(gain as u16, 0x35);
         self.i2c_write(expo as u16 | AG_PIXELCLK, 0x09);
@@ -1308,7 +1326,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // heavily underexposed indoors and nothing else ever corrects it.
     let mut autogain_on = std::env::var("SPCA_AUTOGAIN").as_deref() != Ok("0");
     let mut last_ag_seq = 0u64;
-    println!("autogain {}", if autogain_on { "on" } else { "off" });
+    // How far autogain may push exposure. The kernel's ceiling is 0x256, which
+    // on this sensor costs roughly half the frame rate by the time it gets
+    // there. Lower it to keep the frames coming and accept a darker picture.
+    let ag_max_expo: i32 = std::env::var("SPCA_AG_MAX_EXPO")
+        .ok()
+        .and_then(|v| i32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x256)
+        .clamp(3, 0x7ff);
+    println!(
+        "autogain {} (exposure ceiling 0x{ag_max_expo:03x})",
+        if autogain_on { "on" } else { "off" }
+    );
     let mut shots_taken = 0u32;
     let mut last_shot_seq = 0u64;
     /// Frames to discard before a scripted shot, so automatic gain and
@@ -1408,7 +1437,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let seq = unsafe { (*state).seq };
             if seq >= last_ag_seq + AG_EVERY as u64 {
                 last_ag_seq = seq;
-                cam.autogain();
+                cam.autogain(ag_max_expo);
             }
         }
 

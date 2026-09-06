@@ -103,6 +103,7 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_MODE` | Initial capture mode, `0`-`3` |
 | `SPCA_INTERP` | `1` to start with interpolation already on |
 | `SPCA_AUTOGAIN` | `0` to start with autogain off |
+| `SPCA_AG_MAX_EXPO` | Autogain exposure ceiling in hex, default `256` |
 | `SPCA_DEMOSAIC` | `bilinear` (default) or `block` |
 | `SPCA_SHOT` | Capture this many frames to PPM, then exit |
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
@@ -221,7 +222,31 @@ Two deliberate departures from the kernel:
   rather than hunting.
 
 Autogain runs from the window loop rather than the USB callback: it makes
-blocking control transfers, and stalling `xfer_cb` would starve the ring.
+blocking control transfers, and stalling `xfer_cb` would starve the ring. For
+the same reason the i2c handshakes pump libusb events while waiting instead of
+sleeping -- a plain sleep leaves completed transfers unreaped, and the frame
+rate visibly drops every time autogain acts.
+
+#### Exposure costs frame rate
+
+They are the same knob on this sensor: longer integration is bought by slowing
+the frame clock. Measured in mode 3:
+
+| Exposure ceiling | Capture rate |
+|------------------|--------------|
+| autogain off     | ~20 fps, dark |
+| `0x150`          | ~23 fps |
+| `0x256` (kernel default) | 27 fps falling to ~14 as it brightens |
+
+So a well-exposed picture costs roughly half the frame rate, and that is the
+sensor rather than any overhead in this program. `SPCA_AG_MAX_EXPO` sets the
+ceiling in hex if you would rather keep the frames coming and accept a darker
+picture -- worth doing in mode 3, where the point was speed.
+
+A refinement not implemented: gain is free in frame-rate terms where exposure
+is not, so preferring gain until it saturates and only then reaching for
+exposure would hold the frame rate longer, at the cost of noise. The kernel
+raises both together and so does this.
 
 ### Demosaic
 
