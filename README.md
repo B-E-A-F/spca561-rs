@@ -74,6 +74,7 @@ A window opens with the live feed.
 | Key | Action |
 |-----|--------|
 | `0`-`3` | Switch capture mode (see [Modes](#modes)) |
+| `4` | Toggle frame interpolation (see [Mode 4](#mode-4-frame-interpolation)) |
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
 
@@ -91,6 +92,15 @@ streaming, Esc or close the window to stop
 
 The alternate setting number varies between devices -- it picks the isochronous
 IN endpoint with the largest packet size, whichever alt that is.
+
+Three environment variables set the startup state, which saves clicking the
+window before pressing a key, and makes the thing scriptable:
+
+| Variable | Effect |
+|----------|--------|
+| `SPCA_MODE` | Initial capture mode, `0`-`3` |
+| `SPCA_INTERP` | `1` to start with interpolation already on |
+| `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
 [Troubleshooting](#troubleshooting).
@@ -176,6 +186,62 @@ rather than freeing memory libusb may still write to.
 
 Debayering is deliberately crude -- nearest-neighbour on 2x2 GBRG blocks -- so
 expect colour fringing on edges.
+
+### Mode 4: frame interpolation
+
+`4` fills the gaps between captured frames, so the window updates at its own
+rate instead of holding each frame until the next one lands. It is not a
+capture mode: the camera keeps running in whichever of 0-3 is selected, so `4`
+composes with them and needs no restart and no register write.
+
+Pair it with mode 3. At 160x120 the camera already delivers around 20 fps, so
+reaching the render loop's ~60 Hz ceiling is barely more than a doubling. Mode
+0 at 5 fps needs ten invented frames for every real one, which no interpolator
+makes look like motion -- worth trying once, to see where the technique breaks.
+
+Interpolation costs one frame of latency, unavoidably: filling a gap needs both
+ends of it, so the newest captured frame is only reached an interval after it
+arrives. `S` still saves the most recent real frame, never a composed one.
+
+With it on, the frame rate line reports both figures:
+
+```
+20 fps captured, 55 fps shown
+```
+
+Two engines exist behind that key.
+
+**Block matching** is built in, needs nothing, and is the default. 8x8 blocks,
+a +/-6 pixel search, vectors sampled bilinearly between block centres so the
+warp does not show block edges, and a match-quality floor below which a block
+falls back to a plain blend -- this sensor is noisy enough that a confidently
+wrong vector looks far worse than no vector. Pure integer CPU work; it would
+run on a Pi.
+
+**RIFE** is a neural interpolator, behind the `rife` feature:
+
+```
+cargo run --release --features rife
+```
+
+It needs a RIFE ONNX model, `rife/rife_v4.6.onnx` by default and overridable
+with `SPCA_RIFE_MODEL`. The vs-mlrt project publishes exports; `rife_v8.7z`
+from their model releases carries v4.0 through v4.10, all sharing one input
+contract. A missing model is reported and falls back to block matching, so the
+feature can never leave mode 4 broken.
+
+Note that the two builds produce the same binary name, so whichever you built
+last is what runs.
+
+The feature is off by default because it pulls ONNX Runtime, a large native
+dependency. It asks for DirectML and falls back to CPU if refused; the startup
+line names the engine and backend actually in use. At these frame sizes CPU
+keeps up with the render loop unaided, so DirectML is a convenience rather than
+a requirement -- both hit the same ceiling.
+
+The input tensor is undocumented on the model itself; `src/bin/rife_probe.rs`
+prints the contract that `mod rife` is written against, and is the tool to
+reach for if a different export disagrees.
 
 ### The bridge needs initialising before it will delimit frames
 

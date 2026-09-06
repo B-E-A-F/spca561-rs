@@ -20,3 +20,20 @@ libusb1-sys = "0.7"
 # struct is literally the same type its FFI signatures expect.
 libc = "0.2"
 minifb = "0.28.0"
+# Neural frame interpolation for mode 4, behind the `rife` feature.
+# Off by default and deliberately so: ort pulls ONNX Runtime, a large native
+# dependency, and the backend is useless without a RIFE .onnx on disk. The
+# default build stays at the four crates above and mode 4 still works, just
+# with the built-in block matcher instead.
+# DirectML rather than CUDA: no CUDA or cuDNN install, works on any DX12 GPU,
+# and at these frame sizes the difference is unmeasurable.
+# Default features are left on deliberately. They carry download-binaries,
+# which fetches ONNX Runtime itself -- without it the link fails on
+# OrtGetApiBase -- and the TLS provider that download needs to build at all.
+# So building this feature hits the network, twice: crates, then a runtime.
+ort = { version = "2.0.0-rc.13", features = ["ndarray", "directml"], optional = true }
+ndarray = { version = "0.17", optional = true }
+
+[features]
+default = []
+rife = ["dep:ort", "dep:ndarray"]

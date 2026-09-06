@@ -273,6 +273,18 @@ struct FrameState {
     rgb: Vec<u32>,
     /// Bumped by emit(). The window loop redraws only when this changes.
     seq: u64,
+    /// The frame before `rgb`. Mode 4 interpolates from it towards `rgb`;
+    /// only meaningful once `have_prev` is set.
+    prev_rgb: Vec<u32>,
+    have_prev: bool,
+    /// Frames emitted since the last mode change. Interpolating across a
+    /// switch would blend two different geometries, so the first frame in a
+    /// mode has no predecessor.
+    since_mode: u32,
+    /// When `rgb` was completed, and a smoothed estimate of the gap between
+    /// real frames. Together they put the interpolation phase on the clock.
+    frame_at: Instant,
+    frame_dt: f64,
     /// Set during teardown so xfer_cb stops resubmitting.
     draining: bool,
     /// Transfers libusb currently owns. Teardown waits for this to reach 0
@@ -291,6 +303,11 @@ impl FrameState {
             count: 0,
             rgb: vec![0u32; mode.frame_sz()],
             seq: 0,
+            prev_rgb: vec![0u32; mode.frame_sz()],
+            have_prev: false,
+            since_mode: 0,
+            frame_at: Instant::now(),
+            frame_dt: 0.1,
             draining: false,
             inflight: 0,
         }
@@ -301,6 +318,9 @@ impl FrameState {
         self.mode = mode;
         self.buf = vec![0u8; mode.frame_sz()];
         self.rgb = vec![0u32; mode.frame_sz()];
+        self.prev_rgb = vec![0u32; mode.frame_sz()];
+        self.have_prev = false;
+        self.since_mode = 0;
         self.pos = 0;
         self.valid = false;
     }
@@ -352,6 +372,12 @@ impl FrameState {
     }
 
     fn emit(&mut self) {
+        // Retire the frame we were showing so mode 4 can interpolate from it.
+        // Swapped rather than copied: the outgoing prev_rgb becomes scratch
+        // for the debayer below, which overwrites every pixel of it.
+        std::mem::swap(&mut self.rgb, &mut self.prev_rgb);
+        self.have_prev = self.since_mode >= 1;
+
         // Nearest-neighbour GBRG debayer on 2x2 blocks. Crude on purpose.
         // GBRG: row0 = G B G B, row1 = R G R G
         let (w, h) = (self.mode.w, self.mode.h);
@@ -365,11 +391,24 @@ impl FrameState {
                 self.rgb[y * w + x] = (r << 16) | (g << 8) | b;
             }
         }
+
+        // Measure the real frame interval so interpolation can place itself on
+        // the clock. Smoothed, because isochronous delivery is jittery, and
+        // clamped so one stalled frame cannot park the phase at an endpoint.
+        let now = Instant::now();
+        if self.since_mode >= 1 {
+            let dt = now.duration_since(self.frame_at).as_secs_f64();
+            self.frame_dt = (self.frame_dt * 0.8 + dt * 0.2).clamp(0.005, 1.0);
+        }
+        self.frame_at = now;
+        self.since_mode = self.since_mode.saturating_add(1);
         self.seq = self.seq.wrapping_add(1);
     }
 
-    /// Write the frame currently on screen as a binary PPM. Called from the
-    /// window loop on a keypress, not from the USB callback.
+    /// Write the most recent real frame as a binary PPM. Called from the
+    /// window loop on a keypress, not from the USB callback. Deliberately not
+    /// whatever mode 4 last composed: an interpolated frame is invented, and
+    /// a saved still should be something the sensor actually saw.
     fn save_ppm(&mut self) {
         use std::io::Write;
         let name = format!("frame_{:04}.ppm", self.count);
@@ -387,6 +426,421 @@ impl FrameState {
                 self.count += 1;
             }
             Err(e) => eprintln!("could not write {name}: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mode 4: motion-compensated frame interpolation.
+//
+// Not a capture mode -- the camera keeps running in whichever of 0-3 is
+// selected, and this sits on the render side filling the gaps between real
+// frames so the window updates at its own rate instead of holding each frame
+// until the next one lands.
+//
+// Block matching, then bidirectional warping. Vectors are estimated once per
+// real frame pair and reused for every phase drawn from it, so the per-blit
+// cost is only the warp.
+//
+// Pair this with mode 3: 160x120 already arrives at 25-50 fps, so reaching 60
+// is barely more than a doubling. Interpolating mode 0 to 60 means inventing
+// six to twelve frames for every real one, which no amount of block matching
+// will make look like motion.
+// ---------------------------------------------------------------------------
+
+/// Side of the square block motion is estimated over, in pixels.
+const BLOCK: usize = 8;
+/// Half-width of the search window, in pixels. Motion faster than this is
+/// missed, and the block falls back to a straight blend.
+const SEARCH: i32 = 6;
+/// Mean absolute difference per pixel above which a match is not believed.
+/// This sensor is noisy at these sizes, and a confidently wrong vector looks
+/// far worse than no vector at all.
+const MATCH_LIMIT: i32 = 28;
+
+/// Luma, for matching only. Rec.601 weights in fixed point.
+fn luma(p: u32) -> u8 {
+    let r = (p >> 16) & 0xff;
+    let g = (p >> 8) & 0xff;
+    let b = p & 0xff;
+    ((r * 77 + g * 150 + b * 29) >> 8) as u8
+}
+
+/// Per-channel linear blend. `t` of 0 gives `a`, 1 gives `b`.
+fn blend(a: u32, b: u32, t: f32) -> u32 {
+    let m = (t.clamp(0.0, 1.0) * 256.0) as u32;
+    let n = 256 - m;
+    let mix = |sh: u32| ((((a >> sh) & 0xff) * n + ((b >> sh) & 0xff) * m) >> 8) & 0xff;
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// What mode 4 needs from an interpolator.
+///
+/// The split matters: `prepare` sees each real frame pair once, `compose` runs
+/// per displayed frame. Anything expensive -- motion search, a network forward
+/// pass -- belongs in `prepare`, so its cost is paid per captured frame rather
+/// than per blit. At 20 fps captured and 60 shown that is a 3x difference.
+trait Interpolator {
+    /// Called once when a new real frame pair becomes available.
+    fn prepare(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize);
+
+    /// Compose the frame at phase `t`: 0.0 is `prev`, 1.0 is `cur`.
+    fn compose(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize, t: f32) -> &[u32];
+
+    /// Shown at startup and when switching, so it is never a mystery which
+    /// engine produced what is on screen.
+    fn name(&self) -> &'static str;
+}
+
+struct Interp {
+    /// Motion from prev to cur, one vector per block, row-major over gw x gh.
+    mv: Vec<(i32, i32)>,
+    gw: usize,
+    gh: usize,
+    /// Luma planes for matching, rebuilt once per frame pair.
+    lp: Vec<u8>,
+    lc: Vec<u8>,
+    /// The composed frame handed to the window.
+    out: Vec<u32>,
+}
+
+impl Interp {
+    fn new() -> Self {
+        Interp {
+            mv: Vec::new(),
+            gw: 0,
+            gh: 0,
+            lp: Vec::new(),
+            lc: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    /// Reallocate for a frame size, if it changed.
+    fn fit(&mut self, w: usize, h: usize) {
+        let gw = (w + BLOCK - 1) / BLOCK;
+        let gh = (h + BLOCK - 1) / BLOCK;
+        if self.gw == gw && self.gh == gh && self.out.len() == w * h {
+            return;
+        }
+        self.gw = gw;
+        self.gh = gh;
+        self.mv = vec![(0, 0); gw * gh];
+        self.lp = vec![0u8; w * h];
+        self.lc = vec![0u8; w * h];
+        self.out = vec![0u32; w * h];
+    }
+
+    /// Block-match cur against prev. A vector is the motion from prev to cur:
+    /// content at Q in prev is at Q + mv in cur.
+    fn estimate(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize) {
+        self.fit(w, h);
+        for i in 0..w * h {
+            self.lp[i] = luma(prev[i]);
+            self.lc[i] = luma(cur[i]);
+        }
+
+        for by in 0..self.gh {
+            for bx in 0..self.gw {
+                let x0 = bx * BLOCK;
+                let y0 = by * BLOCK;
+                let bw = BLOCK.min(w - x0);
+                let bh = BLOCK.min(h - y0);
+
+                let mut best = i32::MAX;
+                let mut best_mv = (0i32, 0i32);
+
+                for dy in -SEARCH..=SEARCH {
+                    for dx in -SEARCH..=SEARCH {
+                        let sx = x0 as i32 - dx;
+                        let sy = y0 as i32 - dy;
+                        if sx < 0
+                            || sy < 0
+                            || sx + bw as i32 > w as i32
+                            || sy + bh as i32 > h as i32
+                        {
+                            continue;
+                        }
+                        let mut sad = 0i32;
+                        for y in 0..bh {
+                            let cr = (y0 + y) * w + x0;
+                            let pr = (sy as usize + y) * w + sx as usize;
+                            for x in 0..bw {
+                                sad += (self.lc[cr + x] as i32 - self.lp[pr + x] as i32).abs();
+                            }
+                        }
+                        // On a tie prefer the shorter vector, so flat or noisy
+                        // areas settle on "still" instead of jittering between
+                        // equally good matches.
+                        let closer = sad == best
+                            && dx * dx + dy * dy < best_mv.0 * best_mv.0 + best_mv.1 * best_mv.1;
+                        if sad < best || closer {
+                            best = sad;
+                            best_mv = (dx, dy);
+                        }
+                    }
+                }
+
+                let px = (bw * bh) as i32;
+                self.mv[by * self.gw + bx] = if px > 0 && best / px <= MATCH_LIMIT {
+                    best_mv
+                } else {
+                    (0, 0)
+                };
+            }
+        }
+    }
+
+    /// Motion at a pixel, bilinear between block centres. Sampling the vector
+    /// field smoothly is what keeps block edges from showing up in the warp.
+    fn mv_at(&self, x: usize, y: usize) -> (f32, f32) {
+        let half = BLOCK as f32 / 2.0;
+        let fx = (x as f32 - half) / BLOCK as f32;
+        let fy = (y as f32 - half) / BLOCK as f32;
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+
+        let cx = |v: f32| v.clamp(0.0, self.gw as f32 - 1.0) as usize;
+        let cy = |v: f32| v.clamp(0.0, self.gh as f32 - 1.0) as usize;
+        let (ix0, iy0) = (cx(x0), cy(y0));
+        let (ix1, iy1) = (cx(x0 + 1.0), cy(y0 + 1.0));
+
+        let g = |ix: usize, iy: usize| {
+            let m = self.mv[iy * self.gw + ix];
+            (m.0 as f32, m.1 as f32)
+        };
+        let (a, b, c, d) = (g(ix0, iy0), g(ix1, iy0), g(ix0, iy1), g(ix1, iy1));
+        let top = (a.0 + (b.0 - a.0) * tx, a.1 + (b.1 - a.1) * tx);
+        let bot = (c.0 + (d.0 - c.0) * tx, c.1 + (d.1 - c.1) * tx);
+        (top.0 + (bot.0 - top.0) * ty, top.1 + (bot.1 - top.1) * ty)
+    }
+
+    /// Compose the frame at phase `t` between prev (0.0) and cur (1.0).
+    fn render(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize, t: f32) {
+        let (fw, fh) = (w as f32 - 1.0, h as f32 - 1.0);
+        for y in 0..h {
+            for x in 0..w {
+                let (mx, my) = self.mv_at(x, y);
+                // Content travelling prev -> cur passes through this pixel at
+                // t, so read back along the vector in prev and forward in cur.
+                let px = (x as f32 - mx * t).round().clamp(0.0, fw) as usize;
+                let py = (y as f32 - my * t).round().clamp(0.0, fh) as usize;
+                let qx = (x as f32 + mx * (1.0 - t)).round().clamp(0.0, fw) as usize;
+                let qy = (y as f32 + my * (1.0 - t)).round().clamp(0.0, fh) as usize;
+                self.out[y * w + x] = blend(prev[py * w + px], cur[qy * w + qx], t);
+            }
+        }
+    }
+}
+
+impl Interpolator for Interp {
+    fn prepare(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize) {
+        self.estimate(prev, cur, w, h);
+    }
+
+    fn compose(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize, t: f32) -> &[u32] {
+        self.render(prev, cur, w, h, t);
+        &self.out
+    }
+
+    fn name(&self) -> &'static str {
+        "block matching"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RIFE backend, behind the `rife` feature.
+//
+// vs-mlrt's v1 RIFE exports take one 1x11xHxW float tensor rather than a tidy
+// pair of images, because ONNX GridSample wants absolute sampling coordinates
+// and the export pushes building them onto the caller:
+//
+//   0..2   img0 RGB, 0..1
+//   3..5   img1 RGB, 0..1
+//   6      timestep -- a constant plane holding the phase
+//   7      x normalised to -1..1
+//   8      y normalised to -1..1
+//   9      2/(W-1)
+//   10     2/(H-1)
+//
+// Read off the model with `cargo run --features rife --bin rife_probe`, and
+// the channel meanings from vs-mlrt's own wrapper. None of this is documented
+// on the model itself.
+//
+// Both axes must be a multiple of 32 (the pyramid downsamples by that), which
+// only 352x288 already satisfies, so frames are padded by edge replication and
+// the result cropped back.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rife")]
+mod rife {
+    use super::Interpolator;
+
+    const ALIGN: usize = 32;
+    const CHANNELS: usize = 11;
+
+    fn align_up(v: usize) -> usize {
+        v.div_ceil(ALIGN) * ALIGN
+    }
+
+    pub struct Rife {
+        session: ort::session::Session,
+        /// Which execution provider actually took the graph. Enabling the
+        /// cargo feature only makes DirectML available -- the session still
+        /// has to ask for it, and registration can fail back to CPU quietly,
+        /// so this records what really happened rather than what we wanted.
+        backend: &'static str,
+        w: usize,
+        h: usize,
+        pw: usize,
+        ph: usize,
+        input: Vec<f32>,
+        out: Vec<u32>,
+    }
+
+    impl Rife {
+        pub fn load(path: &str) -> Result<Self, String> {
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+
+            // Ask for DirectML explicitly, and treat failure as informative
+            // rather than fatal -- CPU still runs this model, just slower.
+            // Registration consumes the builder, so the fallback needs a fresh
+            // one rather than reusing the moved value.
+            let base =
+                ort::session::Session::builder().map_err(|e| format!("session builder: {e}"))?;
+            let (mut builder, backend) =
+                match base.with_execution_providers([ort::ep::DirectML::default().build()]) {
+                    Ok(b) => (b, "DirectML"),
+                    // ort returns the builder inside the error, so a refused
+                    // EP costs nothing: recover it and carry on with CPU.
+                    Err(e) => {
+                        eprintln!("rife: DirectML unavailable, running on CPU: {}", e.message());
+                        (e.recover(), "CPU")
+                    }
+                };
+
+            let session = builder
+                .commit_from_memory(&bytes)
+                .map_err(|e| format!("{path}: {e}"))?;
+            Ok(Rife {
+                session,
+                backend,
+                w: 0,
+                h: 0,
+                pw: 0,
+                ph: 0,
+                input: Vec::new(),
+                out: Vec::new(),
+            })
+        }
+
+        /// Reallocate for a frame size and fill the channels that depend only
+        /// on geometry, so they are written once rather than per frame.
+        fn fit(&mut self, w: usize, h: usize) {
+            if self.w == w && self.h == h {
+                return;
+            }
+            self.w = w;
+            self.h = h;
+            self.pw = align_up(w);
+            self.ph = align_up(h);
+            self.input = vec![0.0f32; CHANNELS * self.pw * self.ph];
+            self.out = vec![0u32; w * h];
+
+            let (pw, ph) = (self.pw, self.ph);
+            let plane = pw * ph;
+            let mx = 2.0 / (pw as f32 - 1.0);
+            let my = 2.0 / (ph as f32 - 1.0);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let i = y * pw + x;
+                    self.input[7 * plane + i] = x as f32 * mx - 1.0;
+                    self.input[8 * plane + i] = y as f32 * my - 1.0;
+                    self.input[9 * plane + i] = mx;
+                    self.input[10 * plane + i] = my;
+                }
+            }
+        }
+
+        /// Write one frame into channels `base..base+3`, edge-replicated into
+        /// the padding so the network sees a continued image rather than a
+        /// hard black border it would try to interpret as motion.
+        fn pack(&mut self, src: &[u32], base: usize) {
+            let (w, h, pw, ph) = (self.w, self.h, self.pw, self.ph);
+            let plane = pw * ph;
+            for y in 0..ph {
+                let sy = y.min(h - 1);
+                for x in 0..pw {
+                    let p = src[sy * w + x.min(w - 1)];
+                    let i = y * pw + x;
+                    self.input[base * plane + i] = ((p >> 16) & 0xff) as f32 / 255.0;
+                    self.input[(base + 1) * plane + i] = ((p >> 8) & 0xff) as f32 / 255.0;
+                    self.input[(base + 2) * plane + i] = (p & 0xff) as f32 / 255.0;
+                }
+            }
+        }
+    }
+
+    impl Interpolator for Rife {
+        fn prepare(&mut self, prev: &[u32], cur: &[u32], w: usize, h: usize) {
+            self.fit(w, h);
+            self.pack(prev, 0);
+            self.pack(cur, 3);
+        }
+
+        fn compose(&mut self, _prev: &[u32], _cur: &[u32], w: usize, h: usize, t: f32) -> &[u32] {
+            // Unlike block matching there is nothing to reuse across phases:
+            // t is an input channel, so the forward pass runs per displayed
+            // frame. Only the packing above is saved by prepare().
+            let plane = self.pw * self.ph;
+            for v in &mut self.input[6 * plane..7 * plane] {
+                *v = t;
+            }
+
+            let shape = [1i64, CHANNELS as i64, self.ph as i64, self.pw as i64];
+            // Any failure here leaves the previous composed frame on screen
+            // rather than tearing the stream down: a dropped interpolated
+            // frame is not worth killing a working capture over.
+            let tensor = match ort::value::Tensor::from_array((shape, self.input.clone())) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("rife: building input failed: {e}");
+                    return &self.out;
+                }
+            };
+            let outputs = match self.session.run(ort::inputs!["input" => tensor]) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("rife: forward pass failed: {e}");
+                    return &self.out;
+                }
+            };
+            let data = match outputs["output"].try_extract_tensor::<f32>() {
+                Ok((_shape, d)) => d,
+                Err(e) => {
+                    eprintln!("rife: reading output failed: {e}");
+                    return &self.out;
+                }
+            };
+
+            // Crop the padding back off on the way to 0RGB.
+            let pw = self.pw;
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * pw + x;
+                    let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
+                    self.out[y * w + x] =
+                        (c(data[i]) << 16) | (c(data[plane + i]) << 8) | c(data[2 * plane + i]);
+                }
+            }
+            &self.out
+        }
+
+        fn name(&self) -> &'static str {
+            match self.backend {
+                "DirectML" => "RIFE v4.6 (DirectML)",
+                _ => "RIFE v4.6 (CPU)",
+            }
         }
     }
 }
@@ -592,7 +1046,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cam = Cam { handle };
     cam.init();
+
+    // Startup overrides, so the thing can be driven without a focused window
+    // (scripts, headless checks, or just not wanting to click the preview
+    // before pressing a key). Both are equivalent to the keypress.
     let mut mode = MODES[0];
+    if let Ok(v) = std::env::var("SPCA_MODE") {
+        match v.trim().parse::<usize>() {
+            Ok(i) if i < MODES.len() => mode = MODES[i],
+            _ => eprintln!("SPCA_MODE must be 0-{}, ignoring {v:?}", MODES.len() - 1),
+        }
+    }
     cam.start(mode);
 
     // Deliberately leaked: xfer_cb holds a raw pointer to it for the life of
@@ -609,7 +1073,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // buffer be big enough and takes the dimensions per call, so the smaller
     // modes are scaled up into the same window without recreating it.
     let mut window = Window::new(
-        "SPCA561A live  -  0-3 mode, S saves a PPM, Esc quits",
+        "SPCA561A live  -  0-3 mode, 4 interpolates, S saves a PPM, Esc quits",
         MODES[0].w,
         MODES[0].h,
         WindowOptions { scale: Scale::X2, ..WindowOptions::default() },
@@ -623,18 +1087,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, m) in MODES.iter().enumerate() {
         println!("  {i} = {}x{}", m.w, m.h);
     }
+    println!("press 4 to toggle frame interpolation (try it with mode 3)");
 
     let mut last_pump = Instant::now();
     let mut last_report = Instant::now();
     let mut last_report_seq = 0u64;
+    let mut engine: Box<dyn Interpolator> = Box::new(Interp::new());
+    // RIFE if the feature is built and a model is on disk, block matching
+    // otherwise. A missing model is not an error: mode 4 still works, it just
+    // works with the cheaper engine, and the startup line says which.
+    #[cfg(feature = "rife")]
+    {
+        let path = std::env::var("SPCA_RIFE_MODEL")
+            .unwrap_or_else(|_| "rife/rife_v4.6.onnx".to_string());
+        match rife::Rife::load(&path) {
+            Ok(r) => engine = Box::new(r),
+            Err(e) => eprintln!("rife unavailable, falling back to block matching: {e}"),
+        }
+    }
+    let mut prepared_for = u64::MAX;
+    println!("interpolation engine: {}", engine.name());
+    let mut interp_on = matches!(
+        std::env::var("SPCA_INTERP").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    );
+    let mut blits = 0u64;
+    let mut last_report_blits = 0u64;
     while running.load(Ordering::SeqCst)
         && window.is_open()
         && !window.is_key_down(Key::Escape)
     {
         if last_report.elapsed() >= Duration::from_secs(1) {
             let seq = unsafe { (*state).seq };
-            eprintln!("{} fps", seq - last_report_seq);
+            if interp_on {
+                eprintln!(
+                    "{} fps captured, {} fps shown",
+                    seq - last_report_seq,
+                    blits - last_report_blits
+                );
+            } else {
+                eprintln!("{} fps", seq - last_report_seq);
+            }
             last_report_seq = seq;
+            last_report_blits = blits;
             last_report = Instant::now();
         }
 
@@ -647,6 +1142,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if window.is_key_pressed(Key::S, KeyRepeat::No) {
             unsafe { (*state).save_ppm() };
+        }
+
+        // Mode 4 is a render-side toggle rather than a capture mode: it
+        // composes with whichever of 0-3 the camera is currently in, so it
+        // needs no restart and no register write.
+        if window.is_key_pressed(Key::Key4, KeyRepeat::No) {
+            interp_on = !interp_on;
+            println!("frame interpolation {}", if interp_on { "on" } else { "off" });
         }
 
         // Mode switch. The kernel driver changes format the same way: stop
@@ -680,7 +1183,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_pump = Instant::now();
             // Borrow only for the blit, never across the FFI call above.
             let s = unsafe { &*state };
-            window.update_with_buffer(&s.rgb, s.mode.w, s.mode.h)?;
+            let (w, h) = (s.mode.w, s.mode.h);
+            if interp_on && s.have_prev {
+                // The pair is prepared once however many phases are drawn from
+                // it, so only compose() below runs per blit.
+                if prepared_for != s.seq {
+                    engine.prepare(&s.prev_rgb, &s.rgb, w, h);
+                    prepared_for = s.seq;
+                }
+                // Phase on the wall clock: prev is shown as cur lands, and cur
+                // is reached one interval later. That trailing interval is the
+                // one frame of latency interpolation cannot avoid -- it needs
+                // both ends of the gap before it can fill it.
+                let t = (s.frame_at.elapsed().as_secs_f64() / s.frame_dt).clamp(0.0, 1.0);
+                let frame = engine.compose(&s.prev_rgb, &s.rgb, w, h, t as f32);
+                window.update_with_buffer(frame, w, h)?;
+            } else {
+                window.update_with_buffer(&s.rgb, w, h)?;
+            }
+            blits += 1;
         }
     }
 

@@ -3,3 +3,7 @@ frame_*.ppm
 # written by older builds that carried the capture diagnostics
 diag.log
 trace.log
+
+# RIFE models for mode 4 (mlrt bundle, ~186MB). Fetch separately.
+/rife/
+rife_v8.7z
