@@ -54,11 +54,17 @@ cargo run --release
 A window opens with the live feed. **Esc** quits, **S** writes the current frame
 to `frame_NNNN.ppm` in the working directory.
 
-At startup it prints the endpoint it chose, for example:
+At startup it prints the endpoint it chose, then a frame rate once a second:
 
 ```
 using alt 1, ep 0x81, 1023 bytes/packet
+streaming, Esc or close the window to stop
+5 fps
+5 fps
 ```
+
+If the frame rate sits at `0 fps` while the program is otherwise running, see
+the initialisation note below.
 
 ## Troubleshooting
 

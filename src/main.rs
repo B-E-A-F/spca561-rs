@@ -46,11 +46,6 @@ const MIN_FRAME_FILL: usize = FRAME_SZ * 7 / 8;
 /// Cap on how often the message queue is pumped when no new frame arrived.
 const IDLE_PUMP: Duration = Duration::from_millis(16);
 
-/// Go this long with no new frame before deliberately stalling the USB event
-/// loop, and stall for this long -- long enough for the ring to drain.
-const STALL_AFTER: Duration = Duration::from_millis(250);
-const STALL_FOR: Duration = Duration::from_millis(120);
-
 // ---------------------------------------------------------------------------
 // Init tables, verbatim from spca561.c
 //
@@ -257,24 +252,7 @@ struct FrameState {
     rgb: Vec<u32>,
     /// Bumped by emit(). The window loop redraws only when this changes.
     seq: u64,
-    /// Diagnostics.
-    pkts: u64,
-    short_frames: u64,
-    best_fill: usize,
-    n_start: u64,
-    n_pad: u64,
-    n_inter: u64,
-    n_reject: u64,
-    last_start_len: usize,
-    /// Histogram of data[0] across every packet seen, to find the real marker.
-    hist: [u32; 256],
-    /// Packets xfer_cb discarded before packet() ever saw them.
-    n_zerolen: u64,
-    n_badstatus: u64,
-    status_hist: [u32; 8],
-    /// Raw trace of (data[0], len) for the first N packets, dumped once.
-    trace: Vec<(u8, u16)>,
-    trace_dumped: bool,
+
 }
 
 impl FrameState {
@@ -286,20 +264,7 @@ impl FrameState {
             count: 0,
             rgb: vec![0u32; WIDTH * HEIGHT],
             seq: 0,
-            pkts: 0,
-            short_frames: 0,
-            best_fill: 0,
-            n_start: 0,
-            n_pad: 0,
-            n_inter: 0,
-            n_reject: 0,
-            last_start_len: 0,
-            hist: [0u32; 256],
-            n_zerolen: 0,
-            n_badstatus: 0,
-            status_hist: [0u32; 8],
-            trace: Vec::with_capacity(6000),
-            trace_dumped: false,
+
         }
     }
 
@@ -307,34 +272,22 @@ impl FrameState {
         if data.is_empty() {
             return;
         }
-        self.pkts += 1;
-        self.hist[data[0] as usize] += 1;
-        if self.trace.len() < 6000 {
-            self.trace.push((data[0], data.len() as u16));
-        }
         let seq = data[0];
         let mut body = &data[1..];
 
         if seq == 0xff {
-            self.n_pad += 1;
             return;
         }
 
         if seq == 0x00 {
-            self.n_start += 1;
-            self.last_start_len = data.len();
-            self.best_fill = self.best_fill.max(self.pos);
             if self.valid && self.pos >= MIN_FRAME_FILL {
                 self.emit();
-            } else if self.valid {
-                self.short_frames += 1;
             }
             self.pos = 0;
             self.valid = true;
 
             if body.len() < 2 {
                 self.valid = false;
-                self.n_reject += 1;
                 return;
             }
             if body[1] & 0x10 != 0 {
@@ -345,12 +298,9 @@ impl FrameState {
             }
             if body.len() < 16 {
                 self.valid = false;
-                self.n_reject += 1;
                 return;
             }
             body = &body[16..]; // skip the Rev072A header
-        } else {
-            self.n_inter += 1;
         }
 
         if !self.valid {
@@ -427,15 +377,9 @@ extern "system" fn xfer_cb(xfer: *mut ffi::libusb_transfer) {
         for i in 0..n {
             let d = &*descs.add(i);
             if d.status != ffi::constants::LIBUSB_TRANSFER_COMPLETED {
-                state.n_badstatus += 1;
-                let s = d.status as usize;
-                if s < 8 {
-                    state.status_hist[s] += 1;
-                }
                 continue;
             }
             if d.actual_length == 0 {
-                state.n_zerolen += 1;
                 continue;
             }
             let p = std::slice::from_raw_parts(
@@ -495,7 +439,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("using alt {best_alt}, ep 0x{ep_addr:02x}, {best} bytes/packet");
 
-    let mut handle = handle;
     handle.claim_interface(0)?;
     handle.set_alternate_setting(0, best_alt)?;
 
@@ -570,102 +513,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("streaming, Esc or close the window to stop");
     let mut last_pump = Instant::now();
     let mut last_report = Instant::now();
-    let mut last_frame_at = Instant::now();
-    let mut last_seq_seen = 0u64;
-    let mut mode = 3u8;
-    let (mut iters, mut blits) = (0u64, 0u64);
+    let mut last_report_seq = 0u64;
     while running.load(Ordering::SeqCst)
         && window.is_open()
         && !window.is_key_down(Key::Escape)
     {
-        iters += 1;
         if last_report.elapsed() >= Duration::from_secs(1) {
-            let s = unsafe { &mut *state };
-            let line = format!(
-                "mode {mode} loop {iters}/s blits {blits}/s frames {} | pkts {} = start {} pad {} inter {} | reject {} startlen {} fill {}/{}",
-                s.seq, s.pkts, s.n_start, s.n_pad, s.n_inter, s.n_reject,
-                s.last_start_len, s.best_fill, FRAME_SZ
-            );
-            let mut top: Vec<(usize, u32)> = s.hist.iter().copied().enumerate()
-                .filter(|&(_, c)| c > 0).collect();
-            top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
-            let hist: Vec<String> = top.iter().take(8)
-                .map(|(b, c)| format!("0x{b:02x}={c}")).collect();
-            let line = format!(
-                "{line}
-  data[0]: {} distinct, top: {}
-  dropped in cb: zerolen {} badstatus {} statuses {:?}",
-                top.len(), hist.join(" "), s.n_zerolen, s.n_badstatus, s.status_hist
-            );
-            if s.trace.len() >= 6000 && !s.trace_dumped {
-                s.trace_dumped = true;
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::File::create("trace.log") {
-                    for (i, (m, l)) in s.trace.iter().enumerate() {
-                        let _ = writeln!(f, "{i} {m:02x} {l}");
-                    }
-                }
-                eprintln!("wrote trace.log ({} packets)", s.trace.len());
-            }
-            s.n_zerolen = 0;
-            s.n_badstatus = 0;
-            s.status_hist = [0u32; 8];
-            s.hist = [0u32; 256];
-            eprintln!("{line}");
-            {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("diag.log")
-                {
-                    let _ = writeln!(f, "{line}");
-                }
-            }
-            s.pkts = 0;
-            s.short_frames = 0;
-            s.best_fill = 0;
-            s.n_start = 0;
-            s.n_pad = 0;
-            s.n_inter = 0;
-            s.n_reject = 0;
-            iters = 0;
-            blits = 0;
+            let seq = unsafe { (*state).seq };
+            eprintln!("{} fps", seq - last_report_seq);
+            last_report_seq = seq;
             last_report = Instant::now();
-        }
-
-        // Press 1/2/3 to switch recovery mode live, so one run tells us which
-        // (if either) actually restores sync.
-        if window.is_key_pressed(Key::Key1, KeyRepeat::No) {
-            mode = 1;
-            eprintln!("== mode 1: STALL (sleep, starve libusb) ==");
-        }
-        if window.is_key_pressed(Key::Key2, KeyRepeat::No) {
-            mode = 2;
-            eprintln!("== mode 2: WIGGLE (move window 1px, no stall) ==");
-        }
-        if window.is_key_pressed(Key::Key3, KeyRepeat::No) {
-            mode = 3;
-            eprintln!("== mode 3: OFF ==");
-        }
-
-        let seq_now = unsafe { (*state).seq };
-        if seq_now != last_seq_seen {
-            last_seq_seen = seq_now;
-            last_frame_at = Instant::now();
-        } else if last_frame_at.elapsed() >= STALL_AFTER {
-            match mode {
-                1 => std::thread::sleep(STALL_FOR),
-                2 => {
-                    let (x, y) = window.get_position();
-                    window.set_position(x + 1, y);
-                    window.update();
-                    window.set_position(x, y);
-                    window.update();
-                }
-                _ => {}
-            }
-            last_frame_at = Instant::now();
         }
 
         // Short timeout so the window stays responsive. xfer_cb runs on this
@@ -679,15 +536,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { (*state).save_ppm() };
         }
 
-        // Blit at a fixed ~60 Hz whether or not a new frame arrived. At this
-        // resolution that costs nothing, and it drops the seq comparison as a
-        // possible failure mode.
+        // Blit at a fixed ~60 Hz whether or not a new frame arrived: at this
+        // resolution it costs nothing, and it keeps the window responsive
+        // between frames without a separate message pump.
         if last_pump.elapsed() >= IDLE_PUMP {
             last_pump = Instant::now();
-            let s = unsafe { &mut *state };
-
-            window.update_with_buffer(&s.rgb, WIDTH, HEIGHT)?;
-            blits += 1;
+            // Borrow only for the blit, never across the FFI call above.
+            let rgb = unsafe { &(*state).rgb };
+            window.update_with_buffer(rgb, WIDTH, HEIGHT)?;
         }
     }
 
