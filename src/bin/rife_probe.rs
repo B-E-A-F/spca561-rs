@@ -7,13 +7,13 @@
 //!
 //!     cargo run --release --features rife --bin rife_probe -- rife/rife_v4.6.onnx
 
-#[cfg(not(feature = "rife"))]
+#[cfg(not(feature = "onnx"))]
 fn main() {
     eprintln!("built without the `rife` feature; nothing to probe.");
     eprintln!("cargo run --release --features rife --bin rife_probe");
 }
 
-#[cfg(feature = "rife")]
+#[cfg(feature = "onnx")]
 fn main() {
     let path = std::env::args()
         .nth(1)

@@ -909,7 +909,7 @@ impl Interpolator for Interp {
 // the result cropped back.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "rife")]
+#[cfg(feature = "onnx")]
 mod rife {
     use super::Interpolator;
 
@@ -1078,6 +1078,156 @@ mod rife {
                 "DirectML" => "RIFE v4.6 (DirectML)",
                 _ => "RIFE v4.6 (CPU)",
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real-ESRGAN upscaling, behind the `onnx` feature.
+//
+// A much simpler contract than RIFE: one 1x3xHxW float tensor of RGB in 0..1,
+// the same shape out at the model's scale factor, every dimension dynamic.
+//
+// It runs last, on whatever the window was about to show, so it composes with
+// interpolation without either knowing about the other. That ordering is also
+// the cheap one: upscaling after interpolation means the interpolator works on
+// small frames, where doing it the other way round would have block matching
+// or RIFE chewing through megapixel frames instead.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "onnx")]
+mod esrgan {
+    pub struct Esrgan {
+        session: ort::session::Session,
+        backend: &'static str,
+        /// Discovered by inference rather than assumed: the window has to be
+        /// sized before the first real frame, and the filename is not a
+        /// contract.
+        pub scale: usize,
+        w: usize,
+        h: usize,
+        pub ow: usize,
+        pub oh: usize,
+        input: Vec<f32>,
+        out: Vec<u32>,
+    }
+
+    impl Esrgan {
+        pub fn load(path: &str) -> Result<Self, String> {
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let base =
+                ort::session::Session::builder().map_err(|e| format!("session builder: {e}"))?;
+            let (mut builder, backend) =
+                match base.with_execution_providers([ort::ep::DirectML::default().build()]) {
+                    Ok(b) => (b, "DirectML"),
+                    Err(e) => {
+                        eprintln!("esrgan: DirectML unavailable, running on CPU: {}", e.message());
+                        (e.recover(), "CPU")
+                    }
+                };
+            let session = builder
+                .commit_from_memory(&bytes)
+                .map_err(|e| format!("{path}: {e}"))?;
+
+            let mut sr = Esrgan {
+                session,
+                backend,
+                scale: 0,
+                w: 0,
+                h: 0,
+                ow: 0,
+                oh: 0,
+                input: Vec::new(),
+                out: Vec::new(),
+            };
+            sr.scale = sr.probe_scale()?;
+            Ok(sr)
+        }
+
+        /// Push a small frame through and see how big it comes back.
+        ///
+        /// The scale factor decides the window size, which has to be fixed
+        /// before any camera frame arrives, and these models carry it only in
+        /// their filename. Measuring costs one tiny inference at startup.
+        fn probe_scale(&mut self) -> Result<usize, String> {
+            const N: usize = 32;
+            let probe = vec![0.5f32; 3 * N * N];
+            let tensor = ort::value::Tensor::from_array(([1i64, 3, N as i64, N as i64], probe))
+                .map_err(|e| format!("probe tensor: {e}"))?;
+            let outputs = self
+                .session
+                .run(ort::inputs!["input" => tensor])
+                .map_err(|e| format!("probe inference: {e}"))?;
+            let (shape, _) = outputs["output"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("probe output: {e}"))?;
+            let ow = *shape.last().ok_or("probe output has no shape")? as usize;
+            if ow == 0 || ow % N != 0 {
+                return Err(format!("unexpected probe output width {ow} for {N} in"));
+            }
+            Ok(ow / N)
+        }
+
+        fn fit(&mut self, w: usize, h: usize) {
+            if self.w == w && self.h == h {
+                return;
+            }
+            self.w = w;
+            self.h = h;
+            self.ow = w * self.scale;
+            self.oh = h * self.scale;
+            self.input = vec![0.0f32; 3 * w * h];
+            self.out = vec![0u32; self.ow * self.oh];
+        }
+
+        pub fn name(&self) -> String {
+            format!("Real-ESRGAN {}x ({})", self.scale, self.backend)
+        }
+
+        /// Upscale one frame. On any failure the previous output is returned
+        /// rather than tearing down a working capture.
+        pub fn run(&mut self, src: &[u32], w: usize, h: usize) -> (&[u32], usize, usize) {
+            self.fit(w, h);
+            // Copied out before the borrow of self.out, so callers can have
+            // both the pixels and their dimensions from one call.
+            let (ow, oh) = (self.ow, self.oh);
+            let plane = w * h;
+            for (i, p) in src.iter().enumerate() {
+                self.input[i] = ((p >> 16) & 0xff) as f32 / 255.0;
+                self.input[plane + i] = ((p >> 8) & 0xff) as f32 / 255.0;
+                self.input[2 * plane + i] = (p & 0xff) as f32 / 255.0;
+            }
+
+            let shape = [1i64, 3, h as i64, w as i64];
+            let tensor = match ort::value::Tensor::from_array((shape, self.input.clone())) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("esrgan: building input failed: {e}");
+                    return (&self.out, ow, oh);
+                }
+            };
+            let outputs = match self.session.run(ort::inputs!["input" => tensor]) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("esrgan: forward pass failed: {e}");
+                    return (&self.out, ow, oh);
+                }
+            };
+            let data = match outputs["output"].try_extract_tensor::<f32>() {
+                Ok((_shape, d)) => d,
+                Err(e) => {
+                    eprintln!("esrgan: reading output failed: {e}");
+                    return (&self.out, ow, oh);
+                }
+            };
+
+            let oplane = self.ow * self.oh;
+            for i in 0..oplane.min(self.out.len()) {
+                let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
+                self.out[i] =
+                    (c(data[i]) << 16) | (c(data[oplane + i]) << 8) | c(data[2 * oplane + i]);
+            }
+            (&self.out, ow, oh)
         }
     }
 }
@@ -1349,11 +1499,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The window is sized for the largest mode. minifb only requires the
     // buffer be big enough and takes the dimensions per call, so the smaller
     // modes are scaled up into the same window without recreating it.
+    // The upscaler is loaded before the window because its scale factor sets
+    // the window size, and minifb cannot resize one afterwards. Absent, the
+    // window keeps its old 2x nearest-neighbour magnification.
+    let (mut win_w, mut win_h, mut win_scale) = (MODES[0].w, MODES[0].h, Scale::X2);
+    #[cfg(feature = "onnx")]
+    let mut upscaler: Option<esrgan::Esrgan> = None;
+    #[cfg(feature = "onnx")]
+    if let Ok(p) = std::env::var("SPCA_SR_MODEL") {
+        match esrgan::Esrgan::load(&p) {
+            Ok(sr) => {
+                println!("upscaler: {}", sr.name());
+                win_w = MODES[0].w * sr.scale;
+                win_h = MODES[0].h * sr.scale;
+                win_scale = Scale::X1;
+                upscaler = Some(sr);
+            }
+            Err(e) => eprintln!("upscaler unavailable: {e}"),
+        }
+    }
+    #[cfg(feature = "onnx")]
+    let mut sr_on = upscaler.is_some();
+
     let mut window = Window::new(
-        "SPCA561A live  -  0-3 mode, 4 interpolates, S saves a PPM, Esc quits",
-        MODES[0].w,
-        MODES[0].h,
-        WindowOptions { scale: Scale::X2, ..WindowOptions::default() },
+        "SPCA561A live  -  0-3 mode, 4 interpolates, 6 upscales, S saves, Esc quits",
+        win_w,
+        win_h,
+        WindowOptions { scale: win_scale, ..WindowOptions::default() },
     )?;
     // We pace the loop ourselves off the USB timeout below, so tell minifb
     // not to add any sleep of its own.
@@ -1373,7 +1545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RIFE if the feature is built and a model is on disk, block matching
     // otherwise. A missing model is not an error: mode 4 still works, it just
     // works with the cheaper engine, and the startup line says which.
-    #[cfg(feature = "rife")]
+    #[cfg(feature = "onnx")]
     {
         let path = std::env::var("SPCA_RIFE_MODEL")
             .unwrap_or_else(|_| "rife/rife_v4.6.onnx".to_string());
@@ -1448,15 +1620,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let s = unsafe { &*state };
             if s.seq >= SETTLE && s.seq != last_shot_seq {
                 last_shot_seq = s.seq;
+                let idx = unsafe { (*state).count };
                 if shot_ab {
                     unsafe { (*state).save_ab() };
                 } else {
                     unsafe { (*state).save_ppm() };
                 }
+
+                // An upscaled still alongside the real one. Saved from the
+                // captured frame rather than an interpolated phase, so the
+                // only thing invented in it is the network's own detail.
+                #[cfg(feature = "onnx")]
+                if sr_on {
+                    if let Some(sr) = upscaler.as_mut() {
+                        let (up, ow, oh) = sr.run(&s.rgb, s.mode.w, s.mode.h);
+                        write_ppm(&format!("frame_{idx:04}_sr.ppm"), up, ow, oh);
+                    }
+                }
                 shots_taken += 1;
                 if shots_taken >= shots {
                     break;
                 }
+            }
+        }
+
+        // Upscaling toggles, but the window keeps the size it was created at,
+        // so with it off the smaller frame is magnified into the same window.
+        #[cfg(feature = "onnx")]
+        if window.is_key_pressed(Key::Key6, KeyRepeat::No) {
+            if upscaler.is_some() {
+                sr_on = !sr_on;
+                println!("upscaling {}", if sr_on { "on" } else { "off" });
+            } else {
+                println!("no upscaler loaded; set SPCA_SR_MODEL and restart");
             }
         }
 
@@ -1517,7 +1713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Borrow only for the blit, never across the FFI call above.
             let s = unsafe { &*state };
             let (w, h) = (s.mode.w, s.mode.h);
-            if interp_on && s.have_prev {
+            let base: &[u32] = if interp_on && s.have_prev {
                 // The pair is prepared once however many phases are drawn from
                 // it, so only compose() below runs per blit.
                 if prepared_for != s.seq {
@@ -1529,10 +1725,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // one frame of latency interpolation cannot avoid -- it needs
                 // both ends of the gap before it can fill it.
                 let t = (s.frame_at.elapsed().as_secs_f64() / s.frame_dt).clamp(0.0, 1.0);
-                let frame = engine.compose(&s.prev_rgb, &s.rgb, w, h, t as f32);
-                window.update_with_buffer(frame, w, h)?;
+                engine.compose(&s.prev_rgb, &s.rgb, w, h, t as f32)
             } else {
-                window.update_with_buffer(&s.rgb, w, h)?;
+                &s.rgb
+            };
+
+            // Upscaling runs last, on whatever was about to be shown, so it
+            // composes with interpolation without either knowing about the
+            // other.
+            #[allow(unused_mut)]
+            let mut shown = false;
+            #[cfg(feature = "onnx")]
+            if sr_on {
+                if let Some(sr) = upscaler.as_mut() {
+                    let (up, ow, oh) = sr.run(base, w, h);
+                    window.update_with_buffer(up, ow, oh)?;
+                    shown = true;
+                }
+            }
+            if !shown {
+                window.update_with_buffer(base, w, h)?;
             }
             blits += 1;
         }

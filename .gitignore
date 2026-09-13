@@ -7,3 +7,7 @@ trace.log
 # RIFE models for mode 4 (mlrt bundle, ~186MB). Fetch separately.
 /rife/
 rife_v8.7z
+
+# Real-ESRGAN models for upscaling. Fetch separately.
+/esrgan/
+RealESRGAN*.7z

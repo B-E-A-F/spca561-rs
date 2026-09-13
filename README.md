@@ -76,12 +76,15 @@ A window opens with the live feed.
 | `0`-`3` | Switch capture mode (see [Modes](#modes)) |
 | `4` | Toggle frame interpolation (see [Mode 4](#mode-4-frame-interpolation)) |
 | `5` | Switch demosaic (see [Demosaic](#demosaic)) |
+| `6` | Toggle upscaling (see [Upscaling](#upscaling)) |
 | `A` | Toggle autogain (see [Exposure](#exposure)) |
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
 
 The window is sized for the largest mode and stays that size; smaller modes are
-scaled up into it.
+scaled up into it. With an upscaler loaded it is sized for the largest mode at
+the model's scale factor instead, since minifb cannot resize a window after it
+is created.
 
 At startup it prints the endpoint it chose, then a frame rate once a second:
 
@@ -108,6 +111,7 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_SHOT` | Capture this many frames to PPM, then exit |
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
 | `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
+| `SPCA_SR_MODEL` | Path to a Real-ESRGAN model; loads the upscaler |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
 [Troubleshooting](#troubleshooting).
@@ -190,6 +194,53 @@ isochronous ring is cancelled and fully drained before being rebuilt -- freeing
 a transfer while libusb still has a callback pending is undefined behaviour, so
 teardown waits for every transfer to come back, and on timeout leaks the ring
 rather than freeing memory libusb may still write to.
+
+### Upscaling
+
+`6` toggles Real-ESRGAN super-resolution, behind the same `onnx` feature as
+RIFE. Point `SPCA_SR_MODEL` at a model and it loads at startup:
+
+```
+SPCA_SR_MODEL=esrgan/RealESRGANv2-animevideo-xsx4.onnx cargo run --release --features rife
+```
+
+The models come from vs-mlrt's `model-20211209` release, `RealESRGANv2_v1.7z`
+(4.3 MB) and `RealESRGANv3_v1.7z` (2.3 MB). The contract is far simpler than
+RIFE's: one `1x3xHxW` float tensor of RGB in 0..1 in, the same shape out at the
+model's scale, every dimension dynamic, so no padding or alignment is needed.
+
+The scale factor is measured at startup by pushing a 32x32 probe through and
+seeing how big it comes back, rather than trusted from the filename. It has to
+be known before the window is created and minifb cannot resize afterwards --
+which is also why the upscaler loads before the window, and why `6` toggles
+only whether it is applied, never the window size.
+
+Upscaling runs last, on whatever was about to be shown, so it composes with
+interpolation without either knowing about the other. That ordering is the
+cheap one: the interpolator gets to work on small frames, where the reverse
+would have it chewing through megapixel frames instead.
+
+Measured on this camera with the 4x model on DirectML:
+
+| Mode | Output | Displayed |
+|------|--------|-----------|
+| 3 (160x120) | 640x480 | ~44-50 fps |
+| 0 (352x288) | 1408x1152 | ~25 fps |
+
+**What it does and does not do.** These are the `animevideo` variants, anime
+trained, which is what vs-mlrt ships. On structural edges they are genuinely
+good: a diagonal stair rail in a test frame goes from jagged and noisy to a
+clean continuous line. On texture they flatten, turning hair into smooth
+gradients rather than resolving strands. That suits this sensor, which has few
+fine textures to lose and plenty of edges to clean up, but it is denoising and
+smoothing more than it is recovering detail. Nothing here puts back information
+that 352x288 never captured.
+
+Do the exposure work before reaching for this. Fed an underexposed frame, a
+super-resolution pass magnifies noise into confident invented texture.
+
+`SPCA_SHOT` also writes `frame_NNNN_sr.ppm` while upscaling is on, taken from
+the captured frame rather than an interpolated phase.
 
 ### Exposure
 
