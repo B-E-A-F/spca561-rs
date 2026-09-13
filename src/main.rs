@@ -11,7 +11,7 @@
 
 use libc::timeval;
 use libusb1_sys as ffi;
-use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
+use minifb::{Key, Scale, Window, WindowOptions};
 use rusb::{Context, Direction, TransferType, UsbContext};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -378,6 +378,55 @@ impl Cam {
 
     fn stop(&self) {
         self.reg_w(0x8112, 0x20);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key handling.
+// ---------------------------------------------------------------------------
+
+/// Ignore a key for this long after it fires. Absorbs switch bounce and the
+/// second half of an over-enthusiastic double tap, while staying well under
+/// the interval anyone deliberately toggling something would manage.
+const KEY_LOCKOUT: Duration = Duration::from_millis(250);
+
+/// Edge-triggered keys.
+///
+/// minifb's own `is_key_pressed` is sampled far more often than the window is
+/// updated -- this loop spins on the USB event timeout, not on the blit -- so a
+/// single press can be seen many times over, and toggles flap on and off. This
+/// tracks the previous state per key and reports only the transition, which
+/// does not depend on minifb's repeat semantics at all.
+///
+/// It matters beyond tidiness: a flapping `0`-`3` tears the isochronous ring
+/// down and rebuilds it repeatedly, and a teardown that misses its two second
+/// reclaim window takes the whole program down with it.
+struct Keys {
+    state: Vec<(Key, bool, Instant)>,
+}
+
+impl Keys {
+    fn new(watched: &[Key]) -> Self {
+        let now = Instant::now() - KEY_LOCKOUT;
+        Keys { state: watched.iter().map(|k| (*k, false, now)).collect() }
+    }
+
+    /// True exactly once per physical press.
+    fn pressed(&mut self, window: &Window, key: Key) -> bool {
+        let now = Instant::now();
+        let down = window.is_key_down(key);
+        for (k, was_down, last) in self.state.iter_mut() {
+            if *k != key {
+                continue;
+            }
+            let fired = down && !*was_down && now.duration_since(*last) >= KEY_LOCKOUT;
+            *was_down = down;
+            if fired {
+                *last = now;
+            }
+            return fired;
+        }
+        false
     }
 }
 
@@ -1538,6 +1587,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("press 4 to toggle frame interpolation (try it with mode 3)");
 
+    let mut keys = Keys::new(&[
+        Key::Key0,
+        Key::Key1,
+        Key::Key2,
+        Key::Key3,
+        Key::Key4,
+        Key::Key5,
+        Key::Key6,
+        Key::A,
+        Key::S,
+    ]);
     let mut last_pump = Instant::now();
     let mut last_report = Instant::now();
     let mut last_report_seq = 0u64;
@@ -1589,14 +1649,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ffi::libusb_handle_events_timeout(ctx.as_raw(), &tv);
         }
 
-        if window.is_key_pressed(Key::S, KeyRepeat::No) {
+        if keys.pressed(&window, Key::S) {
             unsafe { (*state).save_ppm() };
         }
 
         // Mode 4 is a render-side toggle rather than a capture mode: it
         // composes with whichever of 0-3 the camera is currently in, so it
         // needs no restart and no register write.
-        if window.is_key_pressed(Key::Key4, KeyRepeat::No) {
+        if keys.pressed(&window, Key::Key4) {
             interp_on = !interp_on;
             println!("frame interpolation {}", if interp_on { "on" } else { "off" });
         }
@@ -1647,7 +1707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Upscaling toggles, but the window keeps the size it was created at,
         // so with it off the smaller frame is magnified into the same window.
         #[cfg(feature = "onnx")]
-        if window.is_key_pressed(Key::Key6, KeyRepeat::No) {
+        if keys.pressed(&window, Key::Key6) {
             if upscaler.is_some() {
                 sr_on = !sr_on;
                 println!("upscaling {}", if sr_on { "on" } else { "off" });
@@ -1656,7 +1716,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if window.is_key_pressed(Key::A, KeyRepeat::No) {
+        if keys.pressed(&window, Key::A) {
             autogain_on = !autogain_on;
             println!("autogain {}", if autogain_on { "on" } else { "off" });
             if autogain_on {
@@ -1666,7 +1726,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Demosaic A/B. Takes effect on the next captured frame, so at low
         // frame rates expect to wait a moment to see it.
-        if window.is_key_pressed(Key::Key5, KeyRepeat::No) {
+        if keys.pressed(&window, Key::Key5) {
             let next = match unsafe { (*state).demosaic } {
                 Demosaic::Block => Demosaic::Bilinear,
                 Demosaic::Bilinear => Demosaic::Block,
@@ -1688,7 +1748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .enumerate()
         {
-            if !window.is_key_pressed(key, KeyRepeat::No) || MODES[i] == mode {
+            if !keys.pressed(&window, key) || MODES[i] == mode {
                 continue;
             }
             mode = MODES[i];
