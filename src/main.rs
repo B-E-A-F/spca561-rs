@@ -382,6 +382,36 @@ impl Cam {
 }
 
 // ---------------------------------------------------------------------------
+// Window.
+// ---------------------------------------------------------------------------
+
+const WINDOW_TITLE: &str = "SPCA561A live  -  0-3 mode, 4 interpolates, 6 upscales, S saves, Esc quits";
+
+/// Build a window whose client area is exactly `w` x `h`.
+///
+/// minifb fixes a window's size at creation, so following the render
+/// resolution -- which changes with the capture mode and with whether the
+/// upscaler is running -- means building a new one. Position carries across so
+/// it does not jump back to the middle of the screen on every toggle.
+///
+/// Scale::X1 throughout: the whole point is that one buffer pixel is one
+/// window pixel, with no magnification happening behind our back.
+fn make_window(w: usize, h: usize, pos: Option<(isize, isize)>) -> Result<Window, minifb::Error> {
+    let mut win = Window::new(
+        WINDOW_TITLE,
+        w,
+        h,
+        WindowOptions { scale: Scale::X1, ..WindowOptions::default() },
+    )?;
+    if let Some((x, y)) = pos {
+        win.set_position(x, y);
+    }
+    // We pace the loop ourselves off the USB timeout, so no sleep of its own.
+    win.set_target_fps(0);
+    Ok(win)
+}
+
+// ---------------------------------------------------------------------------
 // Key handling.
 // ---------------------------------------------------------------------------
 
@@ -1639,10 +1669,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The window is sized for the largest mode. minifb only requires the
     // buffer be big enough and takes the dimensions per call, so the smaller
     // modes are scaled up into the same window without recreating it.
-    // The upscaler is loaded before the window because its scale factor sets
-    // the window size, and minifb cannot resize one afterwards. Absent, the
-    // window keeps its old 2x nearest-neighbour magnification.
-    let (mut win_w, mut win_h, mut win_scale) = (MODES[0].w, MODES[0].h, Scale::X2);
+    // The upscaler is loaded before the window so the first window can be made
+    // at the size it will actually render at.
     #[cfg(feature = "onnx")]
     let mut upscaler: Option<esrgan::Esrgan> = None;
     #[cfg(feature = "onnx")]
@@ -1650,9 +1678,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match esrgan::Esrgan::load(&p) {
             Ok(sr) => {
                 println!("upscaler: {}", sr.name());
-                win_w = MODES[0].w * sr.scale;
-                win_h = MODES[0].h * sr.scale;
-                win_scale = Scale::X1;
                 upscaler = Some(sr);
             }
             Err(e) => eprintln!("upscaler unavailable: {e}"),
@@ -1663,15 +1688,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "onnx")]
     let mut sr_on = upscaler.is_some() && std::env::var("SPCA_SR").as_deref() != Ok("0");
 
-    let mut window = Window::new(
-        "SPCA561A live  -  0-3 mode, 4 interpolates, 6 upscales, S saves, Esc quits",
-        win_w,
-        win_h,
-        WindowOptions { scale: win_scale, ..WindowOptions::default() },
-    )?;
-    // We pace the loop ourselves off the USB timeout below, so tell minifb
-    // not to add any sleep of its own.
-    window.set_target_fps(0);
+    // The window tracks the render resolution: capture size, times the
+    // upscaler's factor when it is running.
+    #[allow(unused_mut)]
+    let mut win_dims = {
+        #[allow(unused_mut)]
+        let mut d = (mode.w, mode.h);
+        #[cfg(feature = "onnx")]
+        if sr_on {
+            if let Some(sr) = upscaler.as_ref() {
+                d = (mode.w * sr.scale, mode.h * sr.scale);
+            }
+        }
+        d
+    };
+    let mut window = make_window(win_dims.0, win_dims.1, None)?;
 
     println!("streaming, Esc or close the window to stop");
     println!("press 0-3 to switch mode:");
@@ -1867,6 +1898,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Borrow only for the blit, never across the FFI call above.
             let s = unsafe { &*state };
             let (w, h) = (s.mode.w, s.mode.h);
+
+            // Keep the window on the render resolution. Both inputs to that --
+            // the capture mode and whether the upscaler is running -- change
+            // only on a keypress, so this rebuilds rarely rather than per
+            // frame, and carries the position across when it does.
+            #[allow(unused_mut)]
+            let mut want = (w, h);
+            #[cfg(feature = "onnx")]
+            if sr_on {
+                if let Some(sr) = upscaler.as_ref() {
+                    want = (w * sr.scale, h * sr.scale);
+                }
+            }
+            if want != win_dims {
+                let pos = window.get_position();
+                match make_window(want.0, want.1, Some(pos)) {
+                    Ok(nw) => {
+                        window = nw;
+                        win_dims = want;
+                        println!("window: {}x{}", want.0, want.1);
+                    }
+                    // Not fatal: the resample below still fills whatever
+                    // window we already have.
+                    Err(e) => eprintln!("could not resize window to {}x{}: {e}", want.0, want.1),
+                }
+            }
             let base: &[u32] = if interp_on && s.have_prev {
                 // The pair is prepared once however many phases are drawn from
                 // it, so only compose() below runs per blit.
@@ -1898,14 +1955,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if !shown {
-                // Fill an oversized window ourselves rather than let minifb
-                // stretch without filtering. Only when the window really is
-                // bigger: at native size this would be a pointless copy.
-                if win_w > w || win_h > h {
-                    let up = resize.run(base, w, h, win_w, win_h);
-                    window.update_with_buffer(up, win_w, win_h)?;
-                } else {
+                // Normally the window is exactly this size and the frame goes
+                // straight out. The resample is the fallback for when it is
+                // not -- a rebuild that failed -- because minifb would
+                // otherwise stretch without filtering.
+                if win_dims == (w, h) {
                     window.update_with_buffer(base, w, h)?;
+                } else {
+                    let up = resize.run(base, w, h, win_dims.0, win_dims.1);
+                    window.update_with_buffer(up, win_dims.0, win_dims.1)?;
                 }
             }
             blits += 1;
