@@ -71,6 +71,17 @@ cargo run --release
 
 A window opens with the live feed.
 
+**Nothing here needs downloading.** The default build has four dependencies, no
+ONNX Runtime and no model files, and every feature described below works: all
+four capture modes, autogain, both demosaics, frame interpolation, and
+resampling into the window.
+
+The optional `onnx` feature adds two neural engines -- RIFE for interpolation
+and Real-ESRGAN for upscaling -- which need model files fetched separately. They
+are strictly additions. Build with the feature but without the models and the
+program still runs: it falls back to the built-in engines, says so only if you
+asked for a model it could not find, and never fails to start over one.
+
 | Key | Action |
 |-----|--------|
 | `0`-`3` | Switch capture mode (see [Modes](#modes)) |

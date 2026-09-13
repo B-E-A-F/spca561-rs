@@ -1675,12 +1675,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut upscaler: Option<esrgan::Esrgan> = None;
     #[cfg(feature = "onnx")]
     if let Ok(p) = std::env::var("SPCA_SR_MODEL") {
-        match esrgan::Esrgan::load(&p) {
-            Ok(sr) => {
-                println!("upscaler: {}", sr.name());
-                upscaler = Some(sr);
+        // Always explicit -- there is no default path -- so a missing file
+        // here really was asked for and is worth reporting. Never fatal:
+        // everything else still runs, just without upscaling.
+        if !std::path::Path::new(&p).exists() {
+            eprintln!("upscaler: no model at {p}, upscaling stays off");
+        } else {
+            match esrgan::Esrgan::load(&p) {
+                Ok(sr) => {
+                    println!("upscaler: {}", sr.name());
+                    upscaler = Some(sr);
+                }
+                Err(e) => eprintln!("upscaler: {p} would not load, upscaling stays off: {e}"),
             }
-            Err(e) => eprintln!("upscaler unavailable: {e}"),
         }
     }
     // Loaded but startable off, so the two paths can be compared from a script
@@ -1732,11 +1739,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // works with the cheaper engine, and the startup line says which.
     #[cfg(feature = "onnx")]
     {
-        let path = std::env::var("SPCA_RIFE_MODEL")
-            .unwrap_or_else(|_| "rife/rife_v4.6.onnx".to_string());
-        match rife::Rife::load(&path) {
-            Ok(r) => engine = Box::new(r),
-            Err(e) => eprintln!("rife unavailable, falling back to block matching: {e}"),
+        // A missing model is the normal case, not a failure: the models are an
+        // optional download and block matching is the documented default. So
+        // say nothing when the default path is simply absent -- the engine
+        // line below already reports what is actually in use -- and speak up
+        // only when someone asked for a specific model and did not get it.
+        let asked = std::env::var("SPCA_RIFE_MODEL").ok();
+        let path = asked
+            .clone()
+            .unwrap_or_else(|| "rife/rife_v4.6.onnx".to_string());
+        if std::path::Path::new(&path).exists() {
+            match rife::Rife::load(&path) {
+                Ok(r) => engine = Box::new(r),
+                Err(e) => eprintln!("rife: {path} would not load, using block matching: {e}"),
+            }
+        } else if asked.is_some() {
+            eprintln!("rife: no model at {path}, using block matching");
         }
     }
     let mut prepared_for = u64::MAX;
@@ -1805,6 +1823,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let s = unsafe { &*state };
             if s.seq >= SETTLE && s.seq != last_shot_seq {
                 last_shot_seq = s.seq;
+                // Captured before saving, which increments it. Only the
+                // upscaled companion file needs it.
+                #[cfg(feature = "onnx")]
                 let idx = unsafe { (*state).count };
                 if shot_ab {
                     unsafe { (*state).save_ab() };
