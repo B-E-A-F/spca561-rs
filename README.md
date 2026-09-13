@@ -112,6 +112,7 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
 | `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
 | `SPCA_SR_MODEL` | Path to a Real-ESRGAN model; loads the upscaler |
+| `SPCA_SR` | `0` to load the upscaler but start with it off |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
 [Troubleshooting](#troubleshooting).
@@ -241,6 +242,24 @@ super-resolution pass magnifies noise into confident invented texture.
 
 `SPCA_SHOT` also writes `frame_NNNN_sr.ppm` while upscaling is on, taken from
 the captured frame rather than an interpolated phase.
+
+#### With upscaling off
+
+The window keeps the size it was created at, so the frame still has to reach
+it. Left to minifb that is `ScaleMode::Stretch`, which blows the frame up with
+no filtering at all -- and at 4x the result is blocky enough that interpolation
+artefacts the network had been smoothing over become obvious. It reads as
+interpolation getting worse when nothing about it has changed; interpolation
+works on native frames and never sees the window.
+
+So with the model off the frame is resampled to the window instead, separable
+bilinear with tap positions and weights precomputed per size. Measured in mode
+0, that fills 1408x1152 at ~55 fps against the model's ~23, so the honest path
+costs nothing and doubles as the A/B: `6` now compares plain resampling with
+the network at the same output size, rather than comparing a stretch with it.
+
+The same applies without any upscaler, where the window is sized for mode 0 and
+the smaller modes are resampled into it rather than stretched.
 
 ### Exposure
 

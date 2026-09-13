@@ -752,12 +752,103 @@ fn luma(p: u32) -> u8 {
     ((r * 77 + g * 150 + b * 29) >> 8) as u8
 }
 
-/// Per-channel linear blend. `t` of 0 gives `a`, 1 gives `b`.
-fn blend(a: u32, b: u32, t: f32) -> u32 {
-    let m = (t.clamp(0.0, 1.0) * 256.0) as u32;
+/// Per-channel linear blend in 1/256ths. `m` of 0 gives `a`, 256 gives `b`.
+fn blend8(a: u32, b: u32, m: u32) -> u32 {
     let n = 256 - m;
     let mix = |sh: u32| ((((a >> sh) & 0xff) * n + ((b >> sh) & 0xff) * m) >> 8) & 0xff;
     (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// Per-channel linear blend. `t` of 0 gives `a`, 1 gives `b`.
+fn blend(a: u32, b: u32, t: f32) -> u32 {
+    blend8(a, b, (t.clamp(0.0, 1.0) * 256.0) as u32)
+}
+
+// ---------------------------------------------------------------------------
+// Plain resampling.
+//
+// The window is sized for the upscaler's output, and minifb cannot be resized
+// afterwards, so with upscaling toggled off the frame has to reach the same
+// size some other way. Left to minifb that is ScaleMode::Stretch, which blows
+// the frame up without filtering: interpolation artefacts that the network had
+// been smoothing over become blocky and obvious, which reads as interpolation
+// getting worse when nothing about it has changed.
+//
+// Separable bilinear with the tap positions and weights precomputed per size,
+// so the per-pixel cost is two blends and nothing else.
+// ---------------------------------------------------------------------------
+
+struct Resize {
+    w: usize,
+    h: usize,
+    ow: usize,
+    oh: usize,
+    /// (low tap, high tap, weight in 1/256ths) per output column and row.
+    xmap: Vec<(usize, usize, u32)>,
+    ymap: Vec<(usize, usize, u32)>,
+    /// Result of the horizontal pass: output width, input height.
+    tmp: Vec<u32>,
+    out: Vec<u32>,
+}
+
+/// Tap pairs and weights mapping `n_out` samples back onto `n_in`.
+///
+/// Half-pixel centred, so the samples sit in the middle of their source
+/// pixels rather than at the edges -- otherwise the image creeps by half a
+/// pixel as the scale factor changes.
+fn axis_map(n_in: usize, n_out: usize) -> Vec<(usize, usize, u32)> {
+    let scale = n_in as f32 / n_out as f32;
+    (0..n_out)
+        .map(|o| {
+            let s = ((o as f32 + 0.5) * scale - 0.5).max(0.0);
+            let i0 = (s.floor() as usize).min(n_in - 1);
+            let i1 = (i0 + 1).min(n_in - 1);
+            (i0, i1, ((s - i0 as f32) * 256.0) as u32)
+        })
+        .collect()
+}
+
+impl Resize {
+    fn new() -> Self {
+        Resize {
+            w: 0,
+            h: 0,
+            ow: 0,
+            oh: 0,
+            xmap: Vec::new(),
+            ymap: Vec::new(),
+            tmp: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    fn run(&mut self, src: &[u32], w: usize, h: usize, ow: usize, oh: usize) -> &[u32] {
+        if (self.w, self.h, self.ow, self.oh) != (w, h, ow, oh) {
+            self.w = w;
+            self.h = h;
+            self.ow = ow;
+            self.oh = oh;
+            self.xmap = axis_map(w, ow);
+            self.ymap = axis_map(h, oh);
+            self.tmp = vec![0u32; ow * h];
+            self.out = vec![0u32; ow * oh];
+        }
+
+        for y in 0..h {
+            let row = y * w;
+            let trow = y * ow;
+            for (ox, &(x0, x1, m)) in self.xmap.iter().enumerate() {
+                self.tmp[trow + ox] = blend8(src[row + x0], src[row + x1], m);
+            }
+        }
+        for (oy, &(y0, y1, m)) in self.ymap.iter().enumerate() {
+            let (r0, r1, orow) = (y0 * ow, y1 * ow, oy * ow);
+            for ox in 0..ow {
+                self.out[orow + ox] = blend8(self.tmp[r0 + ox], self.tmp[r1 + ox], m);
+            }
+        }
+        &self.out
+    }
 }
 
 /// What mode 4 needs from an interpolator.
@@ -1567,8 +1658,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => eprintln!("upscaler unavailable: {e}"),
         }
     }
+    // Loaded but startable off, so the two paths can be compared from a script
+    // as well as from the keyboard.
     #[cfg(feature = "onnx")]
-    let mut sr_on = upscaler.is_some();
+    let mut sr_on = upscaler.is_some() && std::env::var("SPCA_SR").as_deref() != Ok("0");
 
     let mut window = Window::new(
         "SPCA561A live  -  0-3 mode, 4 interpolates, 6 upscales, S saves, Esc quits",
@@ -1598,6 +1691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Key::A,
         Key::S,
     ]);
+    let mut resize = Resize::new();
     let mut last_pump = Instant::now();
     let mut last_report = Instant::now();
     let mut last_report_seq = 0u64;
@@ -1804,7 +1898,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if !shown {
-                window.update_with_buffer(base, w, h)?;
+                // Fill an oversized window ourselves rather than let minifb
+                // stretch without filtering. Only when the window really is
+                // bigger: at native size this would be a pointless copy.
+                if win_w > w || win_h > h {
+                    let up = resize.run(base, w, h, win_w, win_h);
+                    window.update_with_buffer(up, win_w, win_h)?;
+                } else {
+                    window.update_with_buffer(base, w, h)?;
+                }
             }
             blits += 1;
         }
