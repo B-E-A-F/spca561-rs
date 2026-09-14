@@ -92,10 +92,12 @@ asked for a model it could not find, and never fails to start over one.
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
 
-The window is sized for the largest mode and stays that size; smaller modes are
-scaled up into it. With an upscaler loaded it is sized for the largest mode at
-the model's scale factor instead, since minifb cannot resize a window after it
-is created.
+The window is sized to the resolution actually being rendered: the capture
+size, times the upscaler's scale factor while that is running. Both change only
+on a keypress, so the window is rebuilt on mode switches and upscaler toggles,
+carrying its position across. That means mode 3 with upscaling off gives a
+genuinely small 160x120 window, which is what asking for the render resolution
+means at that mode.
 
 At startup it prints the endpoint it chose, then a frame rate once a second:
 
