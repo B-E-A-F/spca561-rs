@@ -385,7 +385,7 @@ impl Cam {
 // Window.
 // ---------------------------------------------------------------------------
 
-const WINDOW_TITLE: &str = "SPCA561A live  -  0-3 mode, 4 interpolates, 6 upscales, S saves, Esc quits";
+const WINDOW_TITLE: &str = "SPCA561A live  -  0-3 mode, 4 interp, 6 upscale, 7 engine, S saves, Esc quits";
 
 /// Build a window whose client area is exactly `w` x `h`.
 ///
@@ -436,19 +436,15 @@ struct Keys {
 }
 
 impl Keys {
-    fn new(watched: &[Key]) -> Self {
-        let now = Instant::now() - KEY_LOCKOUT;
-        Keys { state: watched.iter().map(|k| (*k, false, now)).collect() }
+    fn new() -> Self {
+        Keys { state: Vec::new() }
     }
 
     /// True exactly once per physical press.
     fn pressed(&mut self, window: &Window, key: Key) -> bool {
         let now = Instant::now();
         let down = window.is_key_down(key);
-        for (k, was_down, last) in self.state.iter_mut() {
-            if *k != key {
-                continue;
-            }
+        if let Some((_, was_down, last)) = self.state.iter_mut().find(|(k, _, _)| *k == key) {
             let fired = down && !*was_down && now.duration_since(*last) >= KEY_LOCKOUT;
             *was_down = down;
             if fired {
@@ -456,6 +452,13 @@ impl Keys {
             }
             return fired;
         }
+        // First sight of this key, so start tracking it. Keys register
+        // themselves rather than being listed up front: a key left off such a
+        // list still compiles and still reads as a keypress that simply does
+        // nothing, which is a miserable thing to debug. Reporting false on the
+        // first sample costs nothing, since a key cannot have a meaningful
+        // edge before it has ever been sampled.
+        self.state.push((key, down, now - KEY_LOCKOUT));
         false
     }
 }
@@ -606,6 +609,10 @@ struct FrameState {
     /// real frames. Together they put the interpolation phase on the clock.
     frame_at: Instant,
     frame_dt: f64,
+    /// The most recent raw interval, unsmoothed. Interpolation places its
+    /// phase using `frame_dt`; when the two diverge the phase is being scaled
+    /// against the wrong interval and motion judders regardless of engine.
+    last_dt: f64,
     /// Set during teardown so xfer_cb stops resubmitting.
     draining: bool,
     /// Transfers libusb currently owns. Teardown waits for this to reach 0
@@ -631,6 +638,7 @@ impl FrameState {
             since_mode: 0,
             frame_at: Instant::now(),
             frame_dt: 0.1,
+            last_dt: 0.1,
             draining: false,
             inflight: 0,
         }
@@ -716,6 +724,7 @@ impl FrameState {
         let now = Instant::now();
         if self.since_mode >= 1 {
             let dt = now.duration_since(self.frame_at).as_secs_f64();
+            self.last_dt = dt;
             self.frame_dt = (self.frame_dt * 0.8 + dt * 0.2).clamp(0.005, 1.0);
         }
         self.frame_at = now;
@@ -789,7 +798,27 @@ fn luma(p: u32) -> u8 {
     ((r * 77 + g * 150 + b * 29) >> 8) as u8
 }
 
-/// Per-channel linear blend in 1/256ths. `m` of 0 gives `a`, 256 gives `b`.
+/// Mean absolute per-channel difference between two frames, 0..255.
+///
+/// Used to check an interpolator against its own endpoints: composing at t=0
+/// should reproduce the previous frame and t=1 the current one. Anything else
+/// means the engine is being driven wrongly, and every phase between them is
+/// wrong too.
+fn mad(a: &[u32], b: &[u32]) -> f64 {
+    if a.is_empty() || a.len() != b.len() {
+        return f64::NAN;
+    }
+    let mut sum = 0u64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        for sh in [16, 8, 0] {
+            let (p, q) = (((x >> sh) & 0xff) as i64, ((y >> sh) & 0xff) as i64);
+            sum += (p - q).unsigned_abs();
+        }
+    }
+    sum as f64 / (a.len() * 3) as f64
+}
+
+/// Per-channel blend in 1/256ths. `m` of 0 gives `a`, 256 gives `b`.
 fn blend8(a: u32, b: u32, m: u32) -> u32 {
     let n = 256 - m;
     let mix = |sh: u32| ((((a >> sh) & 0xff) * n + ((b >> sh) & 0xff) * m) >> 8) & 0xff;
@@ -1725,17 +1754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("press 4 to toggle frame interpolation (try it with mode 3)");
 
-    let mut keys = Keys::new(&[
-        Key::Key0,
-        Key::Key1,
-        Key::Key2,
-        Key::Key3,
-        Key::Key4,
-        Key::Key5,
-        Key::Key6,
-        Key::A,
-        Key::S,
-    ]);
+    let mut keys = Keys::new();
     let mut resize = Resize::new();
     // Opt-in timing, for working out where the frame budget actually goes.
     let diag = std::env::var("SPCA_DIAG").as_deref() == Ok("1");
@@ -1748,10 +1767,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // latency, which upscaling made large enough to see as lag and, on moving
     // subjects, as a doubled blend that reads as blur.
     let mut pipeline = Duration::ZERO;
+    let mut endpoints_checked = false;
     let mut last_pump = Instant::now();
     let mut last_report = Instant::now();
     let mut last_report_seq = 0u64;
-    let mut engine: Box<dyn Interpolator> = Box::new(Interp::new());
+    // Both interpolators stay loaded so `7` can switch between them on a live
+    // scene. RIFE is trained on clean video at far higher resolutions than
+    // this camera produces, and whether it actually beats block matching at
+    // 160x120 is a question for the eye, not the spec sheet.
+    let mut engines: Vec<Box<dyn Interpolator>> = vec![Box::new(Interp::new())];
     // RIFE if the feature is built and a model is on disk, block matching
     // otherwise. A missing model is not an error: mode 4 still works, it just
     // works with the cheaper engine, and the startup line says which.
@@ -1768,15 +1792,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "rife/rife_v4.6.onnx".to_string());
         if std::path::Path::new(&path).exists() {
             match rife::Rife::load(&path) {
-                Ok(r) => engine = Box::new(r),
+                Ok(r) => engines.push(Box::new(r)),
                 Err(e) => eprintln!("rife: {path} would not load, using block matching: {e}"),
             }
         } else if asked.is_some() {
             eprintln!("rife: no model at {path}, using block matching");
         }
     }
+    // Start on the last one loaded, so RIFE is the default where it exists.
+    let mut engine_idx = engines.len() - 1;
     let mut prepared_for = u64::MAX;
-    println!("interpolation engine: {}", engine.name());
+    println!("interpolation engine: {}", engines[engine_idx].name());
+    if engines.len() > 1 {
+        println!("press 7 to switch interpolation engine");
+    }
     let mut interp_on = matches!(
         std::env::var("SPCA_INTERP").as_deref(),
         Ok("1") | Ok("on") | Ok("true")
@@ -1808,6 +1837,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     compose_ns as f64 / 1e6,
                     sr_ns as f64 / 1e6,
                     pipeline.as_secs_f64() * 1000.0
+                );
+                let (fdt, ldt) = unsafe { ((*state).frame_dt, (*state).last_dt) };
+                eprintln!(
+                    "  diag: capture interval {:.1} ms last, {:.1} ms smoothed ({:+.0}% off)",
+                    ldt * 1000.0,
+                    fdt * 1000.0,
+                    (ldt / fdt - 1.0) * 100.0
                 );
                 last_short = short;
                 compose_ns = 0;
@@ -1892,6 +1928,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("upscaling {}", if sr_on { "on" } else { "off" });
             } else {
                 println!("no upscaler loaded; set SPCA_SR_MODEL and restart");
+            }
+        }
+
+        // Switch interpolator. prepared_for is reset so the new engine sees
+        // the current pair rather than inheriting the other one's state.
+        if keys.pressed(&window, Key::Key7) {
+            if engines.len() > 1 {
+                engine_idx = (engine_idx + 1) % engines.len();
+                prepared_for = u64::MAX;
+                endpoints_checked = false;
+                println!("interpolation engine: {}", engines[engine_idx].name());
+            } else {
+                println!("only one interpolation engine loaded");
             }
         }
 
@@ -1989,8 +2038,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The pair is prepared once however many phases are drawn from
                 // it, so only compose() below runs per blit.
                 if prepared_for != s.seq {
-                    engine.prepare(&s.prev_rgb, &s.rgb, w, h);
+                    engines[engine_idx].prepare(&s.prev_rgb, &s.rgb, w, h);
                     prepared_for = s.seq;
+
+                    // Once, check the engine against its own endpoints. t=0
+                    // should reproduce prev and t=1 should reproduce cur; if
+                    // they do not, every phase in between is wrong too and no
+                    // amount of phase timing will save it.
+                    if diag && !endpoints_checked {
+                        endpoints_checked = true;
+                        let f0 = engines[engine_idx].compose(&s.prev_rgb, &s.rgb, w, h, 0.0);
+                        let (a, b) = (mad(f0, &s.prev_rgb), mad(f0, &s.rgb));
+                        eprintln!("  diag: compose(t=0) vs prev {a:.1}, vs cur {b:.1}  (want prev lower)");
+                        let f1 = engines[engine_idx].compose(&s.prev_rgb, &s.rgb, w, h, 1.0);
+                        let (c, d) = (mad(f1, &s.prev_rgb), mad(f1, &s.rgb));
+                        eprintln!("  diag: compose(t=1) vs prev {c:.1}, vs cur {d:.1}  (want cur lower)");
+                        eprintln!("  diag: frames differ by {:.1}", mad(&s.prev_rgb, &s.rgb));
+                    }
                 }
                 // Phase on the wall clock: prev is shown as cur lands, and cur
                 // is reached one interval later. That trailing interval is the
@@ -1998,7 +2062,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // both ends of the gap before it can fill it.
                 let ahead = s.frame_at.elapsed() + pipeline;
                 let t = (ahead.as_secs_f64() / s.frame_dt).clamp(0.0, 1.0);
-                engine.compose(&s.prev_rgb, &s.rgb, w, h, t as f32)
+                engines[engine_idx].compose(&s.prev_rgb, &s.rgb, w, h, t as f32)
             } else {
                 &s.rgb
             };

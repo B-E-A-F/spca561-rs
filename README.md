@@ -88,6 +88,7 @@ asked for a model it could not find, and never fails to start over one.
 | `4` | Toggle frame interpolation (see [Mode 4](#mode-4-frame-interpolation)) |
 | `5` | Switch demosaic (see [Demosaic](#demosaic)) |
 | `6` | Toggle upscaling (see [Upscaling](#upscaling)) |
+| `7` | Switch interpolation engine, block matching or RIFE |
 | `A` | Toggle autogain (see [Exposure](#exposure)) |
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
