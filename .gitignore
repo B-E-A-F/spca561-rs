@@ -8,6 +8,7 @@ trace.log
 /rife/
 rife_v8.7z
 
-# Real-ESRGAN models for upscaling. Fetch separately.
+# Real-ESRGAN archives from when upscaling existed. Kept ignored so the local
+# files do not show up as untracked.
 /esrgan/
 RealESRGAN*.7z

@@ -413,14 +413,15 @@ impl Cam {
 // Window.
 // ---------------------------------------------------------------------------
 
-const WINDOW_TITLE: &str = "SPCA561A live  -  0-3 mode, 4 interp, 6 upscale, 7 engine, S saves, Esc quits";
+const WINDOW_TITLE: &str =
+    "SPCA561A live  -  0-3 mode, 4 interp, 5 demosaic, 7 engine, S saves, Esc quits";
 
 /// Build a window whose client area is exactly `w` x `h`.
 ///
 /// minifb fixes a window's size at creation, so following the render
-/// resolution -- which changes with the capture mode and with whether the
-/// upscaler is running -- means building a new one. Position carries across so
-/// it does not jump back to the middle of the screen on every toggle.
+/// resolution, which changes with the capture mode, means building a new one.
+/// Position carries across so it does not jump back to the middle of the
+/// screen on every mode switch.
 ///
 /// Scale::X1 throughout: the whole point is that one buffer pixel is one
 /// window pixel, with no magnification happening behind our back.
@@ -879,12 +880,10 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
 // ---------------------------------------------------------------------------
 // Plain resampling.
 //
-// The window is sized for the upscaler's output, and minifb cannot be resized
-// afterwards, so with upscaling toggled off the frame has to reach the same
-// size some other way. Left to minifb that is ScaleMode::Stretch, which blows
-// the frame up without filtering: interpolation artefacts that the network had
-// been smoothing over become blocky and obvious, which reads as interpolation
-// getting worse when nothing about it has changed.
+// The window is normally the exact size of the frame, so nothing resamples.
+// This is the fallback for when it is not: a window rebuild that failed leaves
+// a frame that still has to reach a differently sized window, and left to
+// minifb that is ScaleMode::Stretch, which magnifies without filtering.
 //
 // Separable bilinear with the tap positions and weights precomputed per size,
 // so the per-pixel cost is two blends and nothing else.
@@ -1334,155 +1333,6 @@ mod rife {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Real-ESRGAN upscaling, behind the `onnx` feature.
-//
-// A much simpler contract than RIFE: one 1x3xHxW float tensor of RGB in 0..1,
-// the same shape out at the model's scale factor, every dimension dynamic.
-//
-// It runs last, on whatever the window was about to show, so it composes with
-// interpolation without either knowing about the other. That ordering is also
-// the cheap one: upscaling after interpolation means the interpolator works on
-// small frames, where doing it the other way round would have block matching
-// or RIFE chewing through megapixel frames instead.
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "onnx")]
-mod esrgan {
-    pub struct Esrgan {
-        session: ort::session::Session,
-        backend: &'static str,
-        /// Discovered by inference rather than assumed: the window has to be
-        /// sized before the first real frame, and the filename is not a
-        /// contract.
-        pub scale: usize,
-        w: usize,
-        h: usize,
-        pub ow: usize,
-        pub oh: usize,
-        input: Vec<f32>,
-        out: Vec<u32>,
-    }
-
-    impl Esrgan {
-        pub fn load(path: &str) -> Result<Self, String> {
-            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-            let base =
-                ort::session::Session::builder().map_err(|e| format!("session builder: {e}"))?;
-            let (mut builder, backend) =
-                match base.with_execution_providers([ort::ep::DirectML::default().build()]) {
-                    Ok(b) => (b, "DirectML"),
-                    Err(e) => {
-                        eprintln!("esrgan: DirectML unavailable, running on CPU: {}", e.message());
-                        (e.recover(), "CPU")
-                    }
-                };
-            let session = builder
-                .commit_from_memory(&bytes)
-                .map_err(|e| format!("{path}: {e}"))?;
-
-            let mut sr = Esrgan {
-                session,
-                backend,
-                scale: 0,
-                w: 0,
-                h: 0,
-                ow: 0,
-                oh: 0,
-                input: Vec::new(),
-                out: Vec::new(),
-            };
-            sr.scale = sr.probe_scale()?;
-            Ok(sr)
-        }
-
-        /// Push a small frame through and see how big it comes back.
-        ///
-        /// The scale factor decides the window size, which has to be fixed
-        /// before any camera frame arrives, and these models carry it only in
-        /// their filename. Measuring costs one tiny inference at startup.
-        fn probe_scale(&mut self) -> Result<usize, String> {
-            const N: usize = 32;
-            let probe = vec![0.5f32; 3 * N * N];
-            let tensor = ort::value::Tensor::from_array(([1i64, 3, N as i64, N as i64], probe))
-                .map_err(|e| format!("probe tensor: {e}"))?;
-            let outputs = self
-                .session
-                .run(ort::inputs!["input" => tensor])
-                .map_err(|e| format!("probe inference: {e}"))?;
-            let (shape, _) = outputs["output"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| format!("probe output: {e}"))?;
-            let ow = *shape.last().ok_or("probe output has no shape")? as usize;
-            if ow == 0 || ow % N != 0 {
-                return Err(format!("unexpected probe output width {ow} for {N} in"));
-            }
-            Ok(ow / N)
-        }
-
-        fn fit(&mut self, w: usize, h: usize) {
-            if self.w == w && self.h == h {
-                return;
-            }
-            self.w = w;
-            self.h = h;
-            self.ow = w * self.scale;
-            self.oh = h * self.scale;
-            self.input = vec![0.0f32; 3 * w * h];
-            self.out = vec![0u32; self.ow * self.oh];
-        }
-
-        pub fn name(&self) -> String {
-            format!("Real-ESRGAN {}x ({})", self.scale, self.backend)
-        }
-
-        /// Upscale one frame. On any failure the previous output is returned
-        /// rather than tearing down a working capture.
-        pub fn run(&mut self, src: &[u32], w: usize, h: usize) -> (&[u32], usize, usize) {
-            self.fit(w, h);
-            // Copied out before the borrow of self.out, so callers can have
-            // both the pixels and their dimensions from one call.
-            let (ow, oh) = (self.ow, self.oh);
-            let plane = w * h;
-            for (i, p) in src.iter().enumerate() {
-                self.input[i] = ((p >> 16) & 0xff) as f32 / 255.0;
-                self.input[plane + i] = ((p >> 8) & 0xff) as f32 / 255.0;
-                self.input[2 * plane + i] = (p & 0xff) as f32 / 255.0;
-            }
-
-            let shape = [1i64, 3, h as i64, w as i64];
-            let tensor = match ort::value::Tensor::from_array((shape, self.input.clone())) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("esrgan: building input failed: {e}");
-                    return (&self.out, ow, oh);
-                }
-            };
-            let outputs = match self.session.run(ort::inputs!["input" => tensor]) {
-                Ok(o) => o,
-                Err(e) => {
-                    eprintln!("esrgan: forward pass failed: {e}");
-                    return (&self.out, ow, oh);
-                }
-            };
-            let data = match outputs["output"].try_extract_tensor::<f32>() {
-                Ok((_shape, d)) => d,
-                Err(e) => {
-                    eprintln!("esrgan: reading output failed: {e}");
-                    return (&self.out, ow, oh);
-                }
-            };
-
-            let oplane = self.ow * self.oh;
-            for i in 0..oplane.min(self.out.len()) {
-                let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
-                self.out[i] =
-                    (c(data[i]) << 16) | (c(data[oplane + i]) << 8) | c(data[2 * oplane + i]);
-            }
-            (&self.out, ow, oh)
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Isochronous ring. Raw FFI, because rusb has no safe isoc API.
@@ -1757,49 +1607,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ring = unsafe { build_ring(cam.handle.as_raw(), ep_addr, best, state)? };
 
-    // The window is sized for the largest mode. minifb only requires the
-    // buffer be big enough and takes the dimensions per call, so the smaller
-    // modes are scaled up into the same window without recreating it.
-    // The upscaler is loaded before the window so the first window can be made
-    // at the size it will actually render at.
-    #[cfg(feature = "onnx")]
-    let mut upscaler: Option<esrgan::Esrgan> = None;
-    #[cfg(feature = "onnx")]
-    if let Ok(p) = std::env::var("SPCA_SR_MODEL") {
-        // Always explicit -- there is no default path -- so a missing file
-        // here really was asked for and is worth reporting. Never fatal:
-        // everything else still runs, just without upscaling.
-        if !std::path::Path::new(&p).exists() {
-            eprintln!("upscaler: no model at {p}, upscaling stays off");
-        } else {
-            match esrgan::Esrgan::load(&p) {
-                Ok(sr) => {
-                    println!("upscaler: {}", sr.name());
-                    upscaler = Some(sr);
-                }
-                Err(e) => eprintln!("upscaler: {p} would not load, upscaling stays off: {e}"),
-            }
-        }
-    }
-    // Loaded but startable off, so the two paths can be compared from a script
-    // as well as from the keyboard.
-    #[cfg(feature = "onnx")]
-    let mut sr_on = upscaler.is_some() && std::env::var("SPCA_SR").as_deref() != Ok("0");
-
-    // The window tracks the render resolution: capture size, times the
-    // upscaler's factor when it is running.
-    #[allow(unused_mut)]
-    let mut win_dims = {
-        #[allow(unused_mut)]
-        let mut d = (mode.w, mode.h);
-        #[cfg(feature = "onnx")]
-        if sr_on {
-            if let Some(sr) = upscaler.as_ref() {
-                d = (mode.w * sr.scale, mode.h * sr.scale);
-            }
-        }
-        d
-    };
+    // The window tracks the render resolution, which is just the capture size.
+    let mut win_dims = (mode.w, mode.h);
     let mut window = make_window(win_dims.0, win_dims.1, None)?;
 
     println!("streaming, Esc or close the window to stop");
@@ -1813,7 +1622,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut resize = Resize::new();
     // Opt-in timing, for working out where the frame budget actually goes.
     let diag = std::env::var("SPCA_DIAG").as_deref() == Ok("1");
-    let (mut compose_ns, mut sr_ns, mut last_short) = (0u64, 0u64, 0u64);
+    let (mut compose_ns, mut last_short) = (0u64, 0u64);
     // Smoothed cost of turning a captured frame into pixels on screen:
     // interpolation, upscaling and the blit. The interpolation phase is chosen
     // before that work runs but the result is only seen after it, so the phase
@@ -1885,12 +1694,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if diag {
                 let short = unsafe { (*state).short_frames };
                 eprintln!(
-                    "  diag: short frames {} (+{}), compose {:.0} ms/s, upscale {:.0} ms/s, \
-                     pipeline {:.1} ms",
+                    "  diag: short frames {} (+{}), compose {:.0} ms/s, pipeline {:.1} ms",
                     short,
                     short - last_short,
                     compose_ns as f64 / 1e6,
-                    sr_ns as f64 / 1e6,
                     pipeline.as_secs_f64() * 1000.0
                 );
                 let (fdt, ldt) = unsafe { ((*state).frame_dt, (*state).last_dt) };
@@ -1902,7 +1709,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 last_short = short;
                 compose_ns = 0;
-                sr_ns = 0;
             }
             last_report_seq = seq;
             last_report_blits = blits;
@@ -1956,42 +1762,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let s = unsafe { &*state };
             if s.seq >= SETTLE && s.seq != last_shot_seq {
                 last_shot_seq = s.seq;
-                // Captured before saving, which increments it. Only the
-                // upscaled companion file needs it.
-                #[cfg(feature = "onnx")]
-                let idx = unsafe { (*state).count };
                 if shot_ab {
                     unsafe { (*state).save_ab() };
                 } else {
                     unsafe { (*state).save_ppm() };
                 }
-
-                // An upscaled still alongside the real one. Saved from the
-                // captured frame rather than an interpolated phase, so the
-                // only thing invented in it is the network's own detail.
-                #[cfg(feature = "onnx")]
-                if sr_on {
-                    if let Some(sr) = upscaler.as_mut() {
-                        let (up, ow, oh) = sr.run(&s.rgb, s.mode.w, s.mode.h);
-                        write_ppm(&format!("frame_{idx:04}_sr.ppm"), up, ow, oh);
-                    }
-                }
                 shots_taken += 1;
                 if shots_taken >= shots {
                     break;
                 }
-            }
-        }
-
-        // Upscaling toggles, but the window keeps the size it was created at,
-        // so with it off the smaller frame is magnified into the same window.
-        #[cfg(feature = "onnx")]
-        if keys.pressed(&window, Key::Key6) {
-            if upscaler.is_some() {
-                sr_on = !sr_on;
-                println!("upscaling {}", if sr_on { "on" } else { "off" });
-            } else {
-                println!("no upscaler loaded; set SPCA_SR_MODEL and restart");
             }
         }
 
@@ -2072,18 +1851,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let s = unsafe { &*state };
             let (w, h) = (s.mode.w, s.mode.h);
 
-            // Keep the window on the render resolution. Both inputs to that --
-            // the capture mode and whether the upscaler is running -- change
-            // only on a keypress, so this rebuilds rarely rather than per
-            // frame, and carries the position across when it does.
-            #[allow(unused_mut)]
-            let mut want = (w, h);
-            #[cfg(feature = "onnx")]
-            if sr_on {
-                if let Some(sr) = upscaler.as_ref() {
-                    want = (w * sr.scale, h * sr.scale);
-                }
-            }
+            // Keep the window on the render resolution. That changes only on a
+            // mode switch, so this rebuilds rarely rather than per frame, and
+            // carries the position across when it does.
+            let want = (w, h);
             if want != win_dims {
                 let pos = window.get_position();
                 match make_window(want.0, want.1, Some(pos)) {
@@ -2132,33 +1903,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             compose_ns += t_compose.elapsed().as_nanos() as u64;
 
-            // Upscaling runs last, on whatever was about to be shown, so it
-            // composes with interpolation without either knowing about the
-            // other.
-            #[allow(unused_mut)]
-            let mut shown = false;
-            #[cfg(feature = "onnx")]
-            if sr_on {
-                if let Some(sr) = upscaler.as_mut() {
-                    let t_sr = Instant::now();
-                    let (up, ow, oh) = sr.run(base, w, h);
-                    let dt = t_sr.elapsed().as_nanos() as u64;
-                    window.update_with_buffer(up, ow, oh)?;
-                    sr_ns += dt;
-                    shown = true;
-                }
-            }
-            if !shown {
-                // Normally the window is exactly this size and the frame goes
-                // straight out. The resample is the fallback for when it is
-                // not -- a rebuild that failed -- because minifb would
-                // otherwise stretch without filtering.
-                if win_dims == (w, h) {
-                    window.update_with_buffer(base, w, h)?;
-                } else {
-                    let up = resize.run(base, w, h, win_dims.0, win_dims.1);
-                    window.update_with_buffer(up, win_dims.0, win_dims.1)?;
-                }
+            // Normally the window is exactly this size and the frame goes
+            // straight out. The resample is the fallback for when it is not --
+            // a rebuild that failed -- because minifb would otherwise stretch
+            // without filtering.
+            if win_dims == (w, h) {
+                window.update_with_buffer(base, w, h)?;
+            } else {
+                let up = resize.run(base, w, h, win_dims.0, win_dims.1);
+                window.update_with_buffer(up, win_dims.0, win_dims.1)?;
             }
             blits += 1;
 

@@ -76,27 +76,24 @@ ONNX Runtime and no model files, and every feature described below works: all
 four capture modes, autogain, both demosaics, frame interpolation, and
 resampling into the window.
 
-The optional `onnx` feature adds two neural engines -- RIFE for interpolation
-and Real-ESRGAN for upscaling -- which need model files fetched separately. They
-are strictly additions. Build with the feature but without the models and the
-program still runs: it falls back to the built-in engines, says so only if you
-asked for a model it could not find, and never fails to start over one.
+The optional `onnx` feature adds RIFE as a second interpolation engine, which
+needs a model file fetched separately. It is strictly an addition. Build with
+the feature but without the model and the program still runs: it falls back to
+block matching, says so only if you asked for a model it could not find, and
+never fails to start over one.
 
 | Key | Action |
 |-----|--------|
 | `0`-`3` | Switch capture mode (see [Modes](#modes)) |
 | `4` | Toggle frame interpolation (see [Mode 4](#mode-4-frame-interpolation)) |
 | `5` | Switch demosaic (see [Demosaic](#demosaic)) |
-| `6` | Toggle upscaling (see [Upscaling](#upscaling)) |
 | `7` | Switch interpolation engine, block matching or RIFE |
 | `A` | Toggle autogain (see [Exposure](#exposure)) |
 | `S` | Write the current frame to `frame_NNNN.ppm` |
 | `Esc` | Quit |
 
-The window is sized to the resolution actually being rendered: the capture
-size, times the upscaler's scale factor while that is running. Both change only
-on a keypress, so the window is rebuilt on mode switches and upscaler toggles,
-carrying its position across. That means mode 3 with upscaling off gives a
+The window is sized to the resolution actually being rendered, so it is rebuilt
+on a mode switch, carrying its position across. That means mode 3 gives a
 genuinely small 160x120 window, which is what asking for the render resolution
 means at that mode.
 
@@ -126,8 +123,6 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_SHOT` | Capture this many frames to PPM, then exit |
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
 | `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
-| `SPCA_SR_MODEL` | Path to a Real-ESRGAN model; loads the upscaler |
-| `SPCA_SR` | `0` to load the upscaler but start with it off |
 | `SPCA_DIAG` | `1` to report lost frames, stage timings and pipeline latency |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
@@ -211,87 +206,6 @@ isochronous ring is cancelled and fully drained before being rebuilt -- freeing
 a transfer while libusb still has a callback pending is undefined behaviour, so
 teardown waits for every transfer to come back, and on timeout leaks the ring
 rather than freeing memory libusb may still write to.
-
-### Upscaling
-
-`6` toggles Real-ESRGAN super-resolution, behind the same `onnx` feature as
-RIFE. Point `SPCA_SR_MODEL` at a model and it loads at startup:
-
-```
-SPCA_SR_MODEL=esrgan/RealESRGANv2-animevideo-xsx4.onnx cargo run --release --features rife
-```
-
-The models come from vs-mlrt's `model-20211209` release, `RealESRGANv2_v1.7z`
-(4.3 MB) and `RealESRGANv3_v1.7z` (2.3 MB). The contract is far simpler than
-RIFE's: one `1x3xHxW` float tensor of RGB in 0..1 in, the same shape out at the
-model's scale, every dimension dynamic, so no padding or alignment is needed.
-
-The scale factor is measured at startup by pushing a 32x32 probe through and
-seeing how big it comes back, rather than trusted from the filename. It has to
-be known before the window is created and minifb cannot resize afterwards --
-which is also why the upscaler loads before the window, and why `6` toggles
-only whether it is applied, never the window size.
-
-Upscaling runs last, on whatever was about to be shown, so it composes with
-interpolation without either knowing about the other. That ordering is the
-cheap one: the interpolator gets to work on small frames, where the reverse
-would have it chewing through megapixel frames instead.
-
-Measured on this camera with the 4x model on DirectML:
-
-| Mode | Output | Displayed |
-|------|--------|-----------|
-| 3 (160x120) | 640x480 | ~44-50 fps |
-| 0 (352x288) | 1408x1152 | ~25 fps |
-
-**It costs latency, not throughput.** The forward pass takes about 15 ms per
-displayed frame at 160x120 and does not get cheaper with a smaller model: the
-2x, 4x and v3 models all measure within a few percent of each other, because at
-these sizes the cost is per-layer dispatch overhead rather than pixels. Shown
-frame rate barely moves, but the render pipeline goes from 3.4 ms to about 20
-ms per frame, measurable with `SPCA_DIAG=1`.
-
-That matters for interpolation. The phase is chosen before that work runs and
-the result is only seen after it, so without correction every displayed frame
-trails reality by the pipeline's own latency -- which reads as lag, and on a
-moving subject as a doubled blend that looks like blur. The phase is therefore
-advanced by a smoothed measurement of that latency, and events are reaped
-immediately before composing so the frame being shown is the freshest captured
-one rather than up to a render interval old. Neither mattered at 3 ms; both do
-at 20.
-
-**What it does and does not do.** These are the `animevideo` variants, anime
-trained, which is what vs-mlrt ships. On structural edges they are genuinely
-good: a diagonal stair rail in a test frame goes from jagged and noisy to a
-clean continuous line. On texture they flatten, turning hair into smooth
-gradients rather than resolving strands. That suits this sensor, which has few
-fine textures to lose and plenty of edges to clean up, but it is denoising and
-smoothing more than it is recovering detail. Nothing here puts back information
-that 352x288 never captured.
-
-Do the exposure work before reaching for this. Fed an underexposed frame, a
-super-resolution pass magnifies noise into confident invented texture.
-
-`SPCA_SHOT` also writes `frame_NNNN_sr.ppm` while upscaling is on, taken from
-the captured frame rather than an interpolated phase.
-
-#### With upscaling off
-
-The window keeps the size it was created at, so the frame still has to reach
-it. Left to minifb that is `ScaleMode::Stretch`, which blows the frame up with
-no filtering at all -- and at 4x the result is blocky enough that interpolation
-artefacts the network had been smoothing over become obvious. It reads as
-interpolation getting worse when nothing about it has changed; interpolation
-works on native frames and never sees the window.
-
-So with the model off the frame is resampled to the window instead, separable
-bilinear with tap positions and weights precomputed per size. Measured in mode
-0, that fills 1408x1152 at ~55 fps against the model's ~23, so the honest path
-costs nothing and doubles as the A/B: `6` now compares plain resampling with
-the network at the same output size, rather than comparing a stretch with it.
-
-The same applies without any upscaler, where the window is sized for mode 0 and
-the smaller modes are resampled into it rather than stretched.
 
 ### Exposure
 

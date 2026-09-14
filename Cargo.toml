@@ -36,9 +36,7 @@ ndarray = { version = "0.17", optional = true }
 
 [features]
 default = []
-# Everything that needs ONNX Runtime: the RIFE interpolator and the
-# Real-ESRGAN upscaler both sit behind this.
+# Everything that needs ONNX Runtime, which is now just the RIFE interpolator.
 onnx = ["dep:ort", "dep:ndarray"]
-# Kept because it is the name the README has always documented, and because
-# RIFE is the reason most people will turn this on.
+# The name the README documents, and the only thing behind the feature now.
 rife = ["onnx"]
