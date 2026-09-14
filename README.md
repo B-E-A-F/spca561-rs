@@ -121,6 +121,7 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_INTERP` | `1` to start with interpolation already on |
 | `SPCA_AUTOGAIN` | `0` to start with autogain off |
 | `SPCA_AG_MAX_EXPO` | Autogain exposure ceiling in hex, default `256` |
+| `SPCA_AG_TARGET` | Autogain mean-luma target, 16-240, default `60` |
 | `SPCA_DEMOSAIC` | `bilinear` (default) or `block` |
 | `SPCA_SHOT` | Capture this many frames to PPM, then exit |
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
@@ -299,10 +300,25 @@ The sensor powers up badly underexposed indoors and nothing in `init()` or
 to find a working exposure, so this does too. It is on by default. `A` toggles
 it, `SPCA_AUTOGAIN=0` starts with it off.
 
-The bridge accumulates per-channel luminance in `0x8621`-`0x8624`. Each pass
-weights those into a luma, and if it is more than 20 away from a target of 110,
-nudges the sensor's exposure (i2c `0x09`) and gain (i2c `0x35`) towards it.
-That is `do_autogain()` from `spca561.c`, and the constants are the kernel's.
+Each pass measures the mean luma of the frame just decoded and, if it is more
+than 20 away from the target, nudges the sensor's exposure (i2c `0x09`) and
+gain (i2c `0x35`) towards it.
+
+**It does not read the bridge's luminance accumulators.** `do_autogain()` in
+`spca561.c` weights registers `0x8621`-`0x8624` into a luma, and on this camera
+those report 3 to 9 whatever the picture is doing -- measured at 7 while the
+frame itself averaged 78. Fed that, the loop never sees itself succeed: it
+drives exposure and gain to maximum and pins them there. That is open-loop
+behaviour wearing a feedback loop's clothes, and it costs half the capture
+rate, because exposure buys integration time by slowing the frame clock. We
+decode every frame anyway, so the frame is the better sensor.
+
+The target is 60, not the kernel's 110, because the measurement changed and a
+setpoint only means anything alongside the measurement it was chosen for.
+Against mean frame luma, 110 is unreachable in ordinary indoor light: the loop
+spends every stop of exposure trying, still falls short, and halves the capture
+rate on the way. `SPCA_AG_TARGET` raises it if the room is bright or the
+picture matters more than the motion.
 
 Measured on this camera, mode 0: mean frame luma goes from about 21 to about
 78 and settles there in roughly ten seconds. The metering is whole-scene, so a

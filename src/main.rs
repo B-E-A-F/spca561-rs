@@ -74,8 +74,19 @@ const IDLE_PUMP: Duration = Duration::from_millis(16);
 /// Each pass costs a handful of control transfers, and those share a link with
 /// the isochronous stream, so this is a compromise rather than "every frame".
 const AG_EVERY: u32 = 5;
-/// Luma the loop steers towards, and how far off it tolerates before acting.
-const AG_TARGET: i32 = 110;
+/// Mean frame luma the loop steers towards, and how far off it tolerates
+/// before acting.
+///
+/// Not the kernel's 110. That was the setpoint for the bridge's own luminance
+/// accumulators, which this does not use -- see autogain() -- and a setpoint
+/// only means anything alongside the measurement it was chosen for. Against
+/// mean frame luma, 110 is unreachable in ordinary indoor light: the loop
+/// spends every stop of exposure trying and still falls short, and exposure is
+/// capture rate, which is what mode 4 interpolates between. 60 is bright
+/// enough to look right and leaves roughly twice the frame rate. Raise it with
+/// SPCA_AG_TARGET if the room is bright or the picture matters more than the
+/// motion.
+const AG_TARGET: i32 = 60;
 const AG_DELTA: i32 = 20;
 /// Shift damping the exposure correction. Undamped, this oscillates.
 const AG_SPRING: i32 = 4;
@@ -323,31 +334,27 @@ impl Cam {
         }
     }
 
-    /// One pass of the kernel driver's do_autogain for Rev072A.
+    /// One pass of autogain: nudge sensor exposure and gain until the frame's
+    /// luma sits near the target. Returns the new exposure, gain and the luma
+    /// it acted on, or None when already within tolerance.
     ///
-    /// The bridge accumulates per-channel luminance in 0x8621-0x8624; this
-    /// weights them to a luma, and nudges sensor exposure and gain until that
-    /// sits near the target. Returns the new (exposure, gain) when it acted.
+    /// `y` is the measured luma of the decoded frame, 0..255. The kernel reads
+    /// per-channel accumulators from the bridge at 0x8621-0x8624 and weights
+    /// those instead, but on this camera they report 3 to 9 regardless of
+    /// exposure, gain or how bright the picture actually is -- measured at
+    /// luma 7 while the frame itself averaged 78. Fed that, the loop never
+    /// sees itself succeed: it drives exposure and gain to maximum and pins
+    /// them there, which is open-loop behaviour wearing a feedback loop's
+    /// clothes, and it costs half the capture rate because exposure buys
+    /// integration time by slowing the frame clock.
+    ///
+    /// We decode every frame anyway, so the frame is the better sensor.
     ///
     /// Constants are the kernel's: target 110, tolerance 20, and a spring of
     /// 4, which is the shift that damps the exposure correction. Without the
     /// damping this oscillates instead of settling.
-    fn autogain(&self, max_expo: i32) -> Option<(u16, u16)> {
-        let mut b = [0u8; 1];
-        let mut read = |i: u16| -> Option<i32> {
-            if self.reg_r(i, &mut b) {
-                Some(b[0] as i32)
-            } else {
-                None
-            }
-        };
-        let gr = read(0x8621)?;
-        let r = read(0x8622)?;
-        let bl = read(0x8623)?;
-        let gb = read(0x8624)?;
-
-        let y = (77 * r + 75 * (gr + gb) + 29 * bl) >> 8;
-        if (y - AG_TARGET).abs() <= AG_DELTA {
+    fn autogain(&self, max_expo: i32, target: i32, y: i32) -> Option<(u16, u16, u16)> {
+        if (y - target).abs() <= AG_DELTA {
             return None;
         }
 
@@ -360,20 +367,41 @@ impl Cam {
         // runs to 0x256, takes minutes to arrive. Loosen the damping while far
         // from target and restore it once close, so it converges quickly and
         // still settles instead of hunting around the target.
-        let err = AG_TARGET - y;
-        let spring = if err.abs() > 2 * AG_DELTA { AG_SPRING - 2 } else { AG_SPRING };
+        let err = target - y;
+        let far = err.abs() > 2 * AG_DELTA;
+        let spring = if far { AG_SPRING - 2 } else { AG_SPRING };
 
-        // Exposure and frame rate are the same knob on this sensor: longer
-        // integration is bought by slowing the frame clock. Measured in mode
-        // 3, letting this run to the kernel's 0x256 ceiling takes capture from
-        // 27 fps down to 14 as it brightens. That is a real trade, not
-        // overhead, so the ceiling is caller's choice.
-        let gain = (gain + err / 50).clamp(3, 0x3f);
-        let expo = (expo + (err >> spring)).clamp(3, max_expo);
+        // Gain and exposure both brighten the picture, but only one of them is
+        // free. Exposure and frame rate are the same knob on this sensor --
+        // longer integration is bought by slowing the frame clock -- so
+        // spending it costs capture rate, and capture rate is what mode 4 has
+        // to interpolate between. Raising both together, as the kernel does,
+        // took mode 3 from 26 fps to 13 within eight seconds of starting:
+        // brighter, but with twice as many invented frames per real one, which
+        // looks like the interpolation got worse.
+        //
+        // So gain goes first and exposure is only spent once gain has run out;
+        // coming back down, exposure is given back first, to win the frame
+        // rate back before trading away signal. Gain costs noise instead,
+        // which is the better trade here.
+        let gstep = if far { err / 20 } else { err / 50 };
+        let estep = err >> spring;
+        let (mut gain, mut expo) = (gain, expo);
+        if err > 0 {
+            if gain < 0x3f {
+                gain = (gain + gstep.max(1)).min(0x3f);
+            } else {
+                expo = (expo + estep.max(1)).min(max_expo);
+            }
+        } else if expo > 3 {
+            expo = (expo + estep.min(-1)).max(3);
+        } else {
+            gain = (gain + gstep.min(-1)).max(3);
+        }
 
         self.i2c_write(gain as u16, 0x35);
         self.i2c_write(expo as u16 | AG_PIXELCLK, 0x09);
-        Some((expo as u16, gain as u16))
+        Some((expo as u16, gain as u16, y as u16))
     }
 
     fn stop(&self) {
@@ -796,6 +824,24 @@ fn luma(p: u32) -> u8 {
     let g = (p >> 8) & 0xff;
     let b = p & 0xff;
     ((r * 77 + g * 150 + b * 29) >> 8) as u8
+}
+
+/// Mean luma of a decoded frame, 0..255.
+///
+/// Sampled rather than exhaustive: autogain wants a scene average, and one
+/// pixel in every 17 settles that to well inside the tolerance it steers by
+/// while costing a fraction of the work. The stride is coprime with every
+/// frame width here, so it does not walk down the same columns each row.
+fn mean_luma(rgb: &[u32]) -> i32 {
+    if rgb.is_empty() {
+        return 0;
+    }
+    let (mut sum, mut n) = (0u64, 0u64);
+    for px in rgb.iter().step_by(17) {
+        sum += luma(*px) as u64;
+        n += 1;
+    }
+    (sum / n.max(1)) as i32
 }
 
 /// Mean absolute per-channel difference between two frames, 0..255.
@@ -1690,8 +1736,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| i32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
         .unwrap_or(0x256)
         .clamp(3, 0x7ff);
+    // How bright to insist the picture is. In a dim room this is the same
+    // decision as the ceiling above, from the other end: demanding more light
+    // than gain alone can supply spends exposure, and exposure is frame rate.
+    let ag_target: i32 = std::env::var("SPCA_AG_TARGET")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(AG_TARGET)
+        .clamp(16, 240);
     println!(
-        "autogain {} (exposure ceiling 0x{ag_max_expo:03x})",
+        "autogain {} (exposure ceiling 0x{ag_max_expo:03x}, luma target {ag_target})",
         if autogain_on { "on" } else { "off" }
     );
     let mut shots_taken = 0u32;
@@ -1881,7 +1935,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let seq = unsafe { (*state).seq };
             if seq >= last_ag_seq + AG_EVERY as u64 {
                 last_ag_seq = seq;
-                cam.autogain(ag_max_expo);
+                // Measured from the frame we just decoded, not from the
+                // bridge's accumulators -- see autogain().
+                let y = mean_luma(unsafe { &(*state).rgb });
+                if let Some((e, g, y)) = cam.autogain(ag_max_expo, ag_target, y) {
+                    if diag {
+                        eprintln!(
+                            "  diag: autogain -> luma {y}/{ag_target}, exposure 0x{e:03x}/0x{ag_max_expo:03x}, gain 0x{g:02x}/0x3f"
+                        );
+                    }
+                }
             }
         }
 
