@@ -1696,6 +1696,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => eprintln!("SPCA_MODE must be 0-{}, ignoring {v:?}", MODES.len() - 1),
         }
     }
+    println!("capture mode {}: {}x{}", mode.id, mode.w, mode.h);
     cam.start(mode);
     cam.report_sensor();
 
