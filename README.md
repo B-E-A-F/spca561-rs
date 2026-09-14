@@ -124,6 +124,7 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
 | `SPCA_SR_MODEL` | Path to a Real-ESRGAN model; loads the upscaler |
 | `SPCA_SR` | `0` to load the upscaler but start with it off |
+| `SPCA_DIAG` | `1` to report lost frames, stage timings and pipeline latency |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
 [Troubleshooting](#troubleshooting).
@@ -238,6 +239,22 @@ Measured on this camera with the 4x model on DirectML:
 |------|--------|-----------|
 | 3 (160x120) | 640x480 | ~44-50 fps |
 | 0 (352x288) | 1408x1152 | ~25 fps |
+
+**It costs latency, not throughput.** The forward pass takes about 15 ms per
+displayed frame at 160x120 and does not get cheaper with a smaller model: the
+2x, 4x and v3 models all measure within a few percent of each other, because at
+these sizes the cost is per-layer dispatch overhead rather than pixels. Shown
+frame rate barely moves, but the render pipeline goes from 3.4 ms to about 20
+ms per frame, measurable with `SPCA_DIAG=1`.
+
+That matters for interpolation. The phase is chosen before that work runs and
+the result is only seen after it, so without correction every displayed frame
+trails reality by the pipeline's own latency -- which reads as lag, and on a
+moving subject as a doubled blend that looks like blur. The phase is therefore
+advanced by a smoothed measurement of that latency, and events are reaped
+immediately before composing so the frame being shown is the freshest captured
+one rather than up to a render interval old. Neither mattered at 3 ms; both do
+at 20.
 
 **What it does and does not do.** These are the `animevideo` variants, anime
 trained, which is what vs-mlrt ships. On structural edges they are genuinely

@@ -591,6 +591,9 @@ struct FrameState {
     demosaic: Demosaic,
     /// Bumped by emit(). The window loop redraws only when this changes.
     seq: u64,
+    /// Frames emitted with a missing tail, i.e. packets were lost. A rising
+    /// count here is the ring not being serviced often enough.
+    short_frames: u64,
     /// The frame before `rgb`. Mode 4 interpolates from it towards `rgb`;
     /// only meaningful once `have_prev` is set.
     prev_rgb: Vec<u32>,
@@ -622,6 +625,7 @@ impl FrameState {
             rgb: vec![0u32; mode.frame_sz()],
             demosaic: Demosaic::Bilinear,
             seq: 0,
+            short_frames: 0,
             prev_rgb: vec![0u32; mode.frame_sz()],
             have_prev: false,
             since_mode: 0,
@@ -657,6 +661,9 @@ impl FrameState {
 
         if seq == 0x00 {
             if self.valid && self.pos >= self.mode.min_fill() {
+                if self.pos < self.mode.frame_sz() {
+                    self.short_frames += 1;
+                }
                 self.emit();
             }
             self.pos = 0;
@@ -1730,6 +1737,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Key::S,
     ]);
     let mut resize = Resize::new();
+    // Opt-in timing, for working out where the frame budget actually goes.
+    let diag = std::env::var("SPCA_DIAG").as_deref() == Ok("1");
+    let (mut compose_ns, mut sr_ns, mut last_short) = (0u64, 0u64, 0u64);
+    // Smoothed cost of turning a captured frame into pixels on screen:
+    // interpolation, upscaling and the blit. The interpolation phase is chosen
+    // before that work runs but the result is only seen after it, so the phase
+    // is advanced by this much to describe the moment it actually appears.
+    // Without it every displayed frame trails reality by the pipeline's own
+    // latency, which upscaling made large enough to see as lag and, on moving
+    // subjects, as a doubled blend that reads as blur.
+    let mut pipeline = Duration::ZERO;
     let mut last_pump = Instant::now();
     let mut last_report = Instant::now();
     let mut last_report_seq = 0u64;
@@ -1779,6 +1797,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 eprintln!("{} fps", seq - last_report_seq);
+            }
+            if diag {
+                let short = unsafe { (*state).short_frames };
+                eprintln!(
+                    "  diag: short frames {} (+{}), compose {:.0} ms/s, upscale {:.0} ms/s, \
+                     pipeline {:.1} ms",
+                    short,
+                    short - last_short,
+                    compose_ns as f64 / 1e6,
+                    sr_ns as f64 / 1e6,
+                    pipeline.as_secs_f64() * 1000.0
+                );
+                last_short = short;
+                compose_ns = 0;
+                sr_ns = 0;
             }
             last_report_seq = seq;
             last_report_blits = blits;
@@ -1916,6 +1949,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // between frames without a separate message pump.
         if last_pump.elapsed() >= IDLE_PUMP {
             last_pump = Instant::now();
+            // Reap anything that landed during the previous frame's GPU work
+            // before choosing what to show. Without this the frame about to be
+            // composed can be a whole render interval stale -- cheap when that
+            // interval was 3 ms, not when upscaling makes it 19.
+            cam.settle(0);
+
             // Borrow only for the blit, never across the FFI call above.
             let s = unsafe { &*state };
             let (w, h) = (s.mode.w, s.mode.h);
@@ -1945,6 +1984,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => eprintln!("could not resize window to {}x{}: {e}", want.0, want.1),
                 }
             }
+            let t_compose = Instant::now();
             let base: &[u32] = if interp_on && s.have_prev {
                 // The pair is prepared once however many phases are drawn from
                 // it, so only compose() below runs per blit.
@@ -1956,11 +1996,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // is reached one interval later. That trailing interval is the
                 // one frame of latency interpolation cannot avoid -- it needs
                 // both ends of the gap before it can fill it.
-                let t = (s.frame_at.elapsed().as_secs_f64() / s.frame_dt).clamp(0.0, 1.0);
+                let ahead = s.frame_at.elapsed() + pipeline;
+                let t = (ahead.as_secs_f64() / s.frame_dt).clamp(0.0, 1.0);
                 engine.compose(&s.prev_rgb, &s.rgb, w, h, t as f32)
             } else {
                 &s.rgb
             };
+            compose_ns += t_compose.elapsed().as_nanos() as u64;
 
             // Upscaling runs last, on whatever was about to be shown, so it
             // composes with interpolation without either knowing about the
@@ -1970,8 +2012,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "onnx")]
             if sr_on {
                 if let Some(sr) = upscaler.as_mut() {
+                    let t_sr = Instant::now();
                     let (up, ow, oh) = sr.run(base, w, h);
+                    let dt = t_sr.elapsed().as_nanos() as u64;
                     window.update_with_buffer(up, ow, oh)?;
+                    sr_ns += dt;
                     shown = true;
                 }
             }
@@ -1988,6 +2033,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             blits += 1;
+
+            // Measured from the top of this block, so it covers everything
+            // between choosing a phase and the pixels being handed over.
+            // Clamped because a one-off stall should not throw the phase into
+            // the next captured frame.
+            let spent = last_pump.elapsed().min(Duration::from_millis(100));
+            pipeline = pipeline.mul_f64(0.8) + spent.mul_f64(0.2);
         }
     }
 
