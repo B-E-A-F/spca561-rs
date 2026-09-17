@@ -465,21 +465,23 @@ public:
 
         // The stream announcement has to reach the consumer before anything
         // will ask for samples, and which event it is depends on whether this
-        // is a first start or a restart.
+        // is a first start or a restart. Exactly once, and carrying the
+        // stream: an announcement with no stream attached is not a weaker
+        // version of this event, it is a malformed one, and the consumer
+        // rejects the whole start with E_INVALIDARG.
         IUnknown *unk = nullptr;
-        stream_->QueryInterface(IID_IUnknown, (void **)&unk);
-        QueueEvent(started_once_ ? MEUpdatedStream : MENewStream, GUID_NULL,
-                   S_OK, nullptr);
-        if (unk) {
-            PROPVARIANT sv;
-            PropVariantInit(&sv);
-            sv.vt = VT_UNKNOWN;
-            sv.punkVal = unk;
-            events_->QueueEventParamVar(started_once_ ? MEUpdatedStream
-                                                      : MENewStream,
-                                        GUID_NULL, S_OK, &sv);
-            PropVariantClear(&sv);
+        HRESULT qi = stream_->QueryInterface(IID_IUnknown, (void **)&unk);
+        if (FAILED(qi) || !unk) {
+            PropVariantClear(&pos);
+            return qi;
         }
+        PROPVARIANT sv;
+        PropVariantInit(&sv);
+        sv.vt = VT_UNKNOWN;
+        sv.punkVal = unk;  // PropVariantClear releases this
+        events_->QueueEventParamVar(started_once_ ? MEUpdatedStream : MENewStream,
+                                    GUID_NULL, S_OK, &sv);
+        PropVariantClear(&sv);
         started_once_ = true;
 
         stream_->SetActive(true);
@@ -785,8 +787,13 @@ public:
     }
 
 private:
+    // Releases its reference to the source but does not shut it down. The
+    // caller owns that decision and makes it through ShutdownObject: Media
+    // Foundation routinely releases the activator as soon as it holds the
+    // source, and tearing the source down here leaves the frame server
+    // holding an object that answers MF_E_SHUTDOWN to everything.
     ~VCamActivate() {
-        ShutdownObject();
+        if (source_) source_->Release();
         if (attrs_) attrs_->Release();
     }
 

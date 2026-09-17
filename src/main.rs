@@ -601,6 +601,168 @@ fn demosaic_bilinear(buf: &[u8], rgb: &mut [u32], w: usize, h: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Publishing to the virtual camera.
+//
+// Writes frames into the shared mapping that vcam/ reads. The two cannot be
+// one program: the media source is an in-process COM server, so Windows loads
+// it inside whichever application opens the camera -- Teams, the Camera app, a
+// browser. A block of shared memory is the entire contract, and it is
+// described in vcam/src/shared.h. Keep the two in step.
+//
+// Raw FFI rather than a crate, to keep the dependency list where it is. These
+// four calls are the whole of it.
+// ---------------------------------------------------------------------------
+
+/// Must match vcam/src/shared.h.
+const VCAM_MAGIC: u32 = 0x4143_5053; // "SPCA"
+const VCAM_VERSION: u32 = 1;
+const VCAM_MAX_W: usize = 1920;
+const VCAM_MAX_H: usize = 1080;
+const VCAM_HEADER_SIZE: usize = 40;
+const VCAM_MAPPING_SIZE: usize = VCAM_HEADER_SIZE + VCAM_MAX_W * VCAM_MAX_H * 4;
+
+/// The size the camera advertises. Fixed, because an application chooses a
+/// media type once and keeps it: switching capture mode must not change what
+/// the camera claims to be, so frames are resampled to this on the way out.
+const VCAM_PUB_W: usize = 352;
+const VCAM_PUB_H: usize = 288;
+
+#[allow(non_snake_case)]
+extern "system" {
+    fn CreateFileMappingW(
+        hFile: isize,
+        lpAttributes: *const c_void,
+        flProtect: u32,
+        dwMaximumSizeHigh: u32,
+        dwMaximumSizeLow: u32,
+        lpName: *const u16,
+    ) -> isize;
+    fn MapViewOfFile(
+        hFileMappingObject: isize,
+        dwDesiredAccess: u32,
+        dwFileOffsetHigh: u32,
+        dwFileOffsetLow: u32,
+        dwNumberOfBytesToMap: usize,
+    ) -> *mut c_void;
+    fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> i32;
+    fn CloseHandle(hObject: isize) -> i32;
+    fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
+}
+
+struct Vcam {
+    mapping: isize,
+    view: *mut u8,
+    /// Its own resampler: the window's runs at a different target size, and
+    /// sharing one would have the two rebuild each other's tap tables every
+    /// frame.
+    resize: Resize,
+    seq: u64,
+}
+
+impl Vcam {
+    fn new() -> Option<Self> {
+        // Name must match VCAM_MAPPING_NAME in shared.h.
+        let name: Vec<u16> = "Local\\spca561_vcam_frame"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // INVALID_HANDLE_VALUE backs this with the page file rather than a
+        // real file: it is a shared buffer, not something anyone should find
+        // on disk afterwards.
+        const INVALID_HANDLE: isize = -1;
+        const PAGE_READWRITE: u32 = 0x04;
+        const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
+
+        unsafe {
+            let mapping = CreateFileMappingW(
+                INVALID_HANDLE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                (VCAM_MAPPING_SIZE >> 32) as u32,
+                (VCAM_MAPPING_SIZE & 0xffff_ffff) as u32,
+                name.as_ptr(),
+            );
+            if mapping == 0 {
+                return None;
+            }
+            let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, VCAM_MAPPING_SIZE);
+            if view.is_null() {
+                CloseHandle(mapping);
+                return None;
+            }
+            Some(Vcam {
+                mapping,
+                view: view as *mut u8,
+                resize: Resize::new(),
+                seq: 0,
+            })
+        }
+    }
+
+    /// Publish one frame, resampling to the advertised size if needed.
+    fn publish(&mut self, frame: &[u32], w: usize, h: usize) {
+        let src: &[u32] = if w == VCAM_PUB_W && h == VCAM_PUB_H {
+            frame
+        } else {
+            self.resize.run(frame, w, h, VCAM_PUB_W, VCAM_PUB_H)
+        };
+
+        let bytes = VCAM_PUB_W * VCAM_PUB_H * 4;
+        unsafe {
+            let hdr = self.view as *mut u32;
+            let seq_ptr = self.view.add(24) as *mut u64;
+            let qpc_ptr = self.view.add(32) as *mut u64;
+
+            // Seqlock: odd while writing. A reader that sees the same even
+            // value either side of its copy knows it got a whole frame. No
+            // mutex, because the reader lives inside somebody else's
+            // application and must never be able to block this loop.
+            self.seq = self.seq.wrapping_add(1);
+            std::ptr::write_volatile(seq_ptr, self.seq | 1);
+            std::sync::atomic::fence(Ordering::Release);
+
+            // 0RGB in a u32 is b,g,r,x in memory on a little-endian machine,
+            // which is exactly BGRX -- what MFVideoFormat_RGB32 means. No
+            // conversion, just the copy.
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr() as *const u8,
+                self.view.add(VCAM_HEADER_SIZE),
+                bytes,
+            );
+
+            hdr.write_volatile(VCAM_MAGIC);
+            hdr.add(1).write_volatile(VCAM_VERSION);
+            hdr.add(2).write_volatile(VCAM_PUB_W as u32);
+            hdr.add(3).write_volatile(VCAM_PUB_H as u32);
+            hdr.add(4).write_volatile((VCAM_PUB_W * 4) as u32);
+            hdr.add(5).write_volatile(0);
+
+            let mut now: i64 = 0;
+            QueryPerformanceCounter(&mut now);
+            std::ptr::write_volatile(qpc_ptr, now as u64);
+
+            std::sync::atomic::fence(Ordering::Release);
+            self.seq = self.seq.wrapping_add(1);
+            std::ptr::write_volatile(seq_ptr, self.seq & !1);
+        }
+    }
+}
+
+impl Drop for Vcam {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.view.is_null() {
+                UnmapViewOfFile(self.view as *const c_void);
+            }
+            if self.mapping != 0 {
+                CloseHandle(self.mapping);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frame assembly.
 // Each isoc packet starts with a 1-byte sequence number:
 //   0x00 -> start of frame, then a 16-byte header to skip (Rev072A)
@@ -1620,6 +1782,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut keys = Keys::new();
     let mut resize = Resize::new();
+
+    // Publishing to the virtual camera is opt-in: it costs a resample and a
+    // copy per captured frame, and is pointless unless vcam_host is running.
+    let mut vcam = if std::env::var("SPCA_VCAM").as_deref() == Ok("1") {
+        match Vcam::new() {
+            Some(v) => {
+                println!("publishing to the virtual camera ({VCAM_PUB_W}x{VCAM_PUB_H})");
+                Some(v)
+            }
+            None => {
+                eprintln!("could not create the virtual camera mapping");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut published_for = u64::MAX;
     // Opt-in timing, for working out where the frame budget actually goes.
     let diag = std::env::var("SPCA_DIAG").as_deref() == Ok("1");
     let (mut compose_ns, mut last_short) = (0u64, 0u64);
@@ -1868,6 +2048,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => eprintln!("could not resize window to {}x{}: {e}", want.0, want.1),
                 }
             }
+            // Publish captured frames, not interpolated ones, and once each.
+            // The consumer has its own clock and asks for samples at its own
+            // rate; handing it invented phases would add this pipeline's
+            // latency to a stream it is already re-timing.
+            if let Some(v) = vcam.as_mut() {
+                if published_for != s.seq {
+                    published_for = s.seq;
+                    v.publish(&s.rgb, w, h);
+                }
+            }
+
             let t_compose = Instant::now();
             let base: &[u32] = if interp_on && s.have_prev {
                 // The pair is prepared once however many phases are drawn from

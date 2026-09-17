@@ -15,6 +15,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfvirtualcamera.h>
+#include <mfreadwrite.h>
 #include <cstdio>
 #include <cwchar>
 
@@ -22,6 +23,7 @@
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "mfsensorgroup.lib")
+#pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "ole32.lib")
 
 // Must match source.cpp. Written here as a string because that is the form
@@ -175,6 +177,146 @@ static int List() {
     return 0;
 }
 
+// Read the shared mapping directly, without involving the camera at all.
+// Splits "is the publisher working" from "is the camera working", which are
+// otherwise one indivisible black screen.
+static int Peek() {
+    // The header layout is duplicated in Rust, so prove the two agree before
+    // trusting anything read through it.
+    std::printf("sizeof(VcamHeader) = %zu (Rust assumes 40)\n",
+                sizeof(VcamHeader));
+
+    vcam::FrameReader reader;
+    if (!reader.open()) {
+        std::printf("no mapping -- run the capture program with SPCA_VCAM=1\n");
+        return 1;
+    }
+
+    std::vector<uint8_t> frame;
+    uint32_t w = 0, h = 0;
+    uint64_t qpc = 0, seq = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (!reader.read(frame, w, h, qpc, seq)) {
+            std::printf("[%d] could not read a clean frame\n", i);
+            Sleep(200);
+            continue;
+        }
+        // Mean luma, to tell a real picture from a black one.
+        uint64_t sum = 0;
+        size_t n = 0;
+        for (size_t p = 0; p + 3 < frame.size(); p += 4 * 17) {
+            sum += (uint64_t)(frame[p + 2] * 77 + frame[p + 1] * 150 +
+                              frame[p] * 29) >> 8;
+            ++n;
+        }
+        std::printf("[%d] %ux%u seq %llu mean luma %llu\n", i, w, h,
+                    (unsigned long long)seq,
+                    (unsigned long long)(n ? sum / n : 0));
+        Sleep(300);
+    }
+    return 0;
+}
+
+// Open the virtual camera and read frames from it, exactly as an application
+// would. This is the only test that covers the whole path: capture, shared
+// memory, the media source, the frame server, and back out to a consumer.
+static int Grab() {
+    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (FAILED(hr)) return 1;
+
+    IMFAttributes *attrs = nullptr;
+    hr = MFCreateAttributes(&attrs, 1);
+    if (SUCCEEDED(hr)) {
+        hr = attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+    }
+
+    IMFActivate **devices = nullptr;
+    UINT32 count = 0;
+    if (SUCCEEDED(hr)) hr = MFEnumDeviceSources(attrs, &devices, &count);
+    if (FAILED(hr)) {
+        std::printf("enumeration failed: 0x%08lx\n", (unsigned long)hr);
+        MFShutdown();
+        return 1;
+    }
+
+    IMFMediaSource *source = nullptr;
+    for (UINT32 i = 0; i < count; ++i) {
+        wchar_t *name = nullptr;
+        UINT32 len = 0;
+        if (SUCCEEDED(devices[i]->GetAllocatedString(
+                MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &name, &len))) {
+            if (wcsstr(name, kFriendlyName) && !source) {
+                std::wprintf(L"opening %s\n", name);
+                devices[i]->ActivateObject(IID_PPV_ARGS(&source));
+            }
+            CoTaskMemFree(name);
+        }
+        devices[i]->Release();
+    }
+    CoTaskMemFree(devices);
+    attrs->Release();
+
+    if (!source) {
+        std::printf("virtual camera not found -- is 'vcam_host run' going?\n");
+        MFShutdown();
+        return 1;
+    }
+
+    IMFSourceReader *reader = nullptr;
+    hr = MFCreateSourceReaderFromMediaSource(source, nullptr, &reader);
+    if (FAILED(hr)) {
+        std::printf("MFCreateSourceReaderFromMediaSource failed: 0x%08lx\n",
+                    (unsigned long)hr);
+        source->Release();
+        MFShutdown();
+        return 1;
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        DWORD streamIndex = 0, flags = 0;
+        LONGLONG ts = 0;
+        IMFSample *sample = nullptr;
+        hr = reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
+                                &streamIndex, &flags, &ts, &sample);
+        if (FAILED(hr)) {
+            std::printf("[%d] ReadSample failed: 0x%08lx\n", i,
+                        (unsigned long)hr);
+            break;
+        }
+        if (!sample) {
+            std::printf("[%d] no sample (flags 0x%lx)\n", i, flags);
+            continue;
+        }
+
+        IMFMediaBuffer *buf = nullptr;
+        if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf))) {
+            BYTE *p = nullptr;
+            DWORD len = 0;
+            if (SUCCEEDED(buf->Lock(&p, nullptr, &len))) {
+                uint64_t sum = 0;
+                size_t n = 0;
+                for (DWORD q = 0; q + 3 < len; q += 4 * 17) {
+                    sum += (uint64_t)(p[q + 2] * 77 + p[q + 1] * 150 +
+                                      p[q] * 29) >> 8;
+                    ++n;
+                }
+                std::printf("[%d] %lu bytes, ts %lld, mean luma %llu\n", i, len,
+                            (long long)ts, (unsigned long long)(n ? sum / n : 0));
+                buf->Unlock();
+            }
+            buf->Release();
+        }
+        sample->Release();
+    }
+
+    reader->Release();
+    source->Shutdown();
+    source->Release();
+    MFShutdown();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : "run";
     if (strcmp(cmd, "register") == 0) return CallDllEntry("DllRegisterServer");
@@ -182,7 +324,9 @@ int main(int argc, char **argv) {
         return CallDllEntry("DllUnregisterServer");
     if (strcmp(cmd, "run") == 0) return Run();
     if (strcmp(cmd, "list") == 0) return List();
+    if (strcmp(cmd, "peek") == 0) return Peek();
+    if (strcmp(cmd, "grab") == 0) return Grab();
 
-    std::printf("usage: vcam_host [register|unregister|run|list]\n");
+    std::printf("usage: vcam_host [register|unregister|run|list|peek|grab]\n");
     return 2;
 }
