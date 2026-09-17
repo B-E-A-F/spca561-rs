@@ -12,3 +12,6 @@ rife_v8.7z
 # files do not show up as untracked.
 /esrgan/
 RealESRGAN*.7z
+
+# Virtual camera build output
+/vcam/build/
