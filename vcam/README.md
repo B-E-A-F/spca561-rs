@@ -86,6 +86,12 @@ the fallback so it cannot be mistaken for having worked.
 
 ## Things that cost time
 
+**Do not force-kill `vcam_host`.** Quit it with Enter. A killed host never
+reaches `Remove()`, and the camera registration outlives the process that made
+it -- the next `run` then fails with `MF_E_INVALIDREQUEST` for trying to
+register a camera that, as far as the frame server is concerned, already
+exists. Restarting the service clears it.
+
 **The DLL stays locked after use.** The Frame Server service keeps it loaded
 after the camera goes away, so rebuilding fails with `LNK1104: cannot open
 file`. Restart the service from an elevated prompt:

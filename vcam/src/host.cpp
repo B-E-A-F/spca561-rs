@@ -111,6 +111,17 @@ static int Run() {
     if (FAILED(hr)) {
         std::printf("IMFVirtualCamera::Start failed: 0x%08lx\n",
                     (unsigned long)hr);
+        if (hr == MF_E_INVALIDREQUEST) {
+            std::printf(
+                "\nMF_E_INVALIDREQUEST usually means a camera for this source\n"
+                "is already registered -- normally because a previous run was\n"
+                "force-killed, so it never got to Remove() its camera. The\n"
+                "registration outlives the process that made it.\n\n"
+                "Clear it by restarting the frame server, elevated:\n"
+                "    Restart-Service FrameServer -Force\n\n"
+                "And quit this with Enter rather than killing it, so the\n"
+                "camera is removed on the way out.\n");
+        }
         cam->Remove();
         cam->Release();
         MFShutdown();
