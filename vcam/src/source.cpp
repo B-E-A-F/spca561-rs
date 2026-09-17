@@ -174,6 +174,7 @@ public:
     // IMFMediaStream2 -- the frame server starts and stops individual streams
     // through this rather than only through the source.
     HRESULT STDMETHODCALLTYPE SetStreamState(MF_STREAM_STATE state) override {
+        LogLine(L"stream: SetStreamState %d", (int)state);
         switch (state) {
         case MF_STREAM_STATE_RUNNING:
             active_ = true;
@@ -453,6 +454,7 @@ public:
     HRESULT STDMETHODCALLTYPE Start(IMFPresentationDescriptor *pd,
                                     const GUID *timeFormat,
                                     const PROPVARIANT *start) override {
+        LogLine(L"source: Start");
         if (timeFormat && *timeFormat != GUID_NULL) {
             return MF_E_UNSUPPORTED_TIME_FORMAT;
         }
@@ -556,6 +558,10 @@ HRESULT STDMETHODCALLTYPE VCamStream::GetMediaSource(IMFMediaSource **src) {
 }
 
 HRESULT STDMETHODCALLTYPE VCamStream::RequestSample(IUnknown *token) {
+    static LONG s_reqs = 0;
+    if (InterlockedIncrement(&s_reqs) <= 5) {
+        LogLine(L"stream: RequestSample #%ld active=%d", s_reqs, (int)active_);
+    }
     if (!events_) return MF_E_SHUTDOWN;
     if (!active_) return MF_E_MEDIA_SOURCE_WRONGSTATE;
 

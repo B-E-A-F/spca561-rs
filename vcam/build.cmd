@@ -18,12 +18,32 @@ call %VCVARS% >nul 2>nul
 cd /d "%~dp0"
 if not exist build mkdir build
 
+rem The Frame Server service keeps vcam_source.dll loaded after the camera goes
+rem away, so relinking fails with LNK1104 until the service is cycled. Try it
+rem here: elevated, this makes the build self-sufficient; unelevated it fails
+rem harmlessly and the link error below says what to do.
+net session >nul 2>&1
+if not errorlevel 1 (
+    echo Restarting FrameServer to release the DLL ...
+    net stop FrameServer >nul 2>&1
+    net start FrameServer >nul 2>&1
+)
+
 echo Building vcam_source.dll ...
 cl /nologo /EHsc /std:c++17 /W3 /O2 /LD ^
    /Fo:build\ /Fe:build\vcam_source.dll ^
    src\source.cpp src\shared.cpp ^
    /link /DEF:src\vcam_source.def
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+    echo.
+    echo If that was LNK1104 "cannot open file", the Frame Server service still
+    echo has the DLL loaded from the last run. Either re-run this build from an
+    echo elevated prompt, or release it by hand with:
+    echo.
+    echo     Restart-Service FrameServer -Force
+    echo.
+    exit /b 1
+)
 
 echo Building vcam_host.exe ...
 cl /nologo /EHsc /std:c++17 /W3 /O2 ^
