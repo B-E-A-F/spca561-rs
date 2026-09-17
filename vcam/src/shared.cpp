@@ -96,6 +96,26 @@ bool FrameReader::read(std::vector<uint8_t> &out, uint32_t &width,
         memcpy(out.data(), pixels, bytes);
         const uint64_t stamp = hdr->qpc;
 
+        // Reject a frame nobody has refreshed lately.
+        //
+        // The mapping is backed by a file, which outlives the publisher: stop
+        // the capture program and frame.bin stays on disk with a perfectly
+        // valid last frame in it. Without this the camera would serve that
+        // forever, showing a frozen picture that looks live -- worse than
+        // black, because nothing about it says the source has gone away.
+        LARGE_INTEGER freq, now;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&now);
+        if (freq.QuadPart > 0 && stamp != 0) {
+            const int64_t age_ms =
+                ((int64_t)now.QuadPart - (int64_t)stamp) * 1000 / freq.QuadPart;
+            // Generous: mode 0 captures at a handful of frames a second, and a
+            // stalled USB frame should not blank the camera.
+            if (age_ms > 2000 || age_ms < -2000) {
+                return false;
+            }
+        }
+
         // Reading seq again after the copy is what makes this safe: unchanged
         // and even means nothing was written while we were copying.
         MemoryBarrier();
