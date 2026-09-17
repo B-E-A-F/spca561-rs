@@ -603,15 +603,20 @@ HRESULT STDMETHODCALLTYPE VCamStream::RequestSample(IUnknown *token) {
     if (SUCCEEDED(hr)) hr = MFCreateSample(&sample);
     if (SUCCEEDED(hr)) hr = sample->AddBuffer(buf);
     if (SUCCEEDED(hr)) {
-        // Pace by the advertised frame rate rather than by arrival. The
-        // capture side is jittery and slower than 30 fps, so timestamping by
-        // QPC would hand consumers an irregular stream they would try to
-        // correct for; a steady clock with repeated frames is what a webcam
-        // that cannot keep up normally looks like.
+        // System time, not a count from zero.
+        //
+        // This source declares MFMEDIASOURCE_IS_LIVE, and a live source's
+        // timestamps have to be in the presentation clock's timebase, which is
+        // system time. Numbering samples 0, 333333, 666666 makes every frame
+        // look hours stale to the consumer: it discards them all, receives
+        // nothing within its timeout, and invalidates the device -- which
+        // presents as a camera that starts, is asked for samples, is given
+        // them successfully, and still shows black.
         const LONGLONG dur = 10000000LL * kFpsDen / kFpsNum;
-        hr = sample->SetSampleTime(next_pts_);
+        const LONGLONG now = MFGetSystemTime();
+        hr = sample->SetSampleTime(now);
         if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(dur);
-        next_pts_ += dur;
+        next_pts_ = now;
     }
     if (SUCCEEDED(hr) && token) {
         hr = sample->SetUnknown(MFSampleExtension_Token, token);
