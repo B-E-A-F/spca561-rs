@@ -559,9 +559,8 @@ HRESULT STDMETHODCALLTYPE VCamStream::GetMediaSource(IMFMediaSource **src) {
 
 HRESULT STDMETHODCALLTYPE VCamStream::RequestSample(IUnknown *token) {
     static LONG s_reqs = 0;
-    if (InterlockedIncrement(&s_reqs) <= 5) {
-        LogLine(L"stream: RequestSample #%ld active=%d", s_reqs, (int)active_);
-    }
+    const LONG req = InterlockedIncrement(&s_reqs);
+    const bool trace = req <= 5;
     if (!events_) return MF_E_SHUTDOWN;
     if (!active_) return MF_E_MEDIA_SOURCE_WRONGSTATE;
 
@@ -619,6 +618,18 @@ HRESULT STDMETHODCALLTYPE VCamStream::RequestSample(IUnknown *token) {
     }
     if (SUCCEEDED(hr)) {
         hr = events_->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample);
+    }
+
+    if (trace) {
+        // Everything that decides whether a frame reaches the consumer, in one
+        // line: whether the publisher was visible at all, what size it gave
+        // us, whether a token came with the request, and what queuing the
+        // sample returned. Each round of this costs an elevated service
+        // restart, so it logs the lot rather than one thing at a time.
+        LogLine(L"stream: RequestSample #%ld active=%d read=%d %ux%u token=%d "
+                L"pts=%lld hr=0x%08x openerr=%lu",
+                req, (int)active_, (int)have, w, h, token ? 1 : 0,
+                (long long)next_pts_, (unsigned)hr, reader_.last_error_);
     }
 
     if (sample) sample->Release();

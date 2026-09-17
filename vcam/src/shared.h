@@ -28,10 +28,21 @@ extern "C" {
 #define VCAM_MAGIC 0x41435053u
 #define VCAM_VERSION 1u
 
-// Named so both processes find the same mapping. Local\ scopes it to the
-// session, which is what we want: no reason to publish frames across sessions,
-// and Global\ would need privileges we are deliberately avoiding.
-#define VCAM_MAPPING_NAME L"Local\\spca561_vcam_frame"
+// Backed by a real file rather than a named page-file mapping, and that is the
+// whole point.
+//
+// A named mapping lives in a session's object namespace: Local\ is visible
+// only within one session, and the media source is hosted by the Frame Server,
+// which runs in its own. The publisher would create the mapping in the user
+// session and the source would look for it in the service session and never
+// find it -- a camera that starts, streams, and shows black forever. Global\
+// crosses sessions but needs SeCreateGlobalPrivilege, which would mean running
+// the capture program elevated just to show a picture.
+//
+// A file has no session. Both processes open the same path and the question
+// does not arise.
+#define VCAM_FILE_DIR L"C:\\ProgramData\\spca561"
+#define VCAM_FILE_PATH L"C:\\ProgramData\\spca561\\frame.bin"
 
 // Largest frame the mapping can hold. The camera's biggest mode is 352x288,
 // but the mapping is sized once and never resized, so leave room to grow
@@ -96,6 +107,13 @@ public:
 private:
     void *mapping_ = nullptr;
     void *view_ = nullptr;
+
+public:
+    /// Why the last open failed. ERROR_FILE_NOT_FOUND here with the capture
+    /// program demonstrably running means the name is not visible from this
+    /// process -- which is the interesting case, because the media source may
+    /// be hosted in a different session than the publisher.
+    unsigned long last_error_ = 0;
 };
 
 } // namespace vcam

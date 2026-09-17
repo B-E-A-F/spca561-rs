@@ -647,6 +647,15 @@ extern "system" {
     fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> i32;
     fn CloseHandle(hObject: isize) -> i32;
     fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *const c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: isize,
+    ) -> isize;
 }
 
 struct Vcam {
@@ -661,28 +670,55 @@ struct Vcam {
 
 impl Vcam {
     fn new() -> Option<Self> {
-        // Name must match VCAM_MAPPING_NAME in shared.h.
-        let name: Vec<u16> = "Local\\spca561_vcam_frame"
+        // Backed by a file, not a named page-file mapping. A named mapping
+        // lives in a session's object namespace, and the media source is
+        // hosted by the Frame Server in its own session: it would look for a
+        // name the publisher created somewhere it cannot see, and show black
+        // forever. Global\ crosses sessions but needs a privilege, which would
+        // mean running this elevated just to show a picture. A file has no
+        // session. Path must match VCAM_FILE_PATH in vcam/src/shared.h.
+        let _ = std::fs::create_dir_all("C:\\ProgramData\\spca561");
+        let path: Vec<u16> = "C:\\ProgramData\\spca561\\frame.bin"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
 
-        // INVALID_HANDLE_VALUE backs this with the page file rather than a
-        // real file: it is a shared buffer, not something anyone should find
-        // on disk afterwards.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const OPEN_ALWAYS: u32 = 4;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
         const INVALID_HANDLE: isize = -1;
         const PAGE_READWRITE: u32 = 0x04;
         const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
 
         unsafe {
+            let file = CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            );
+            if file == INVALID_HANDLE {
+                return None;
+            }
+
+            // A size larger than the file extends it, so there is no separate
+            // step to size the thing.
             let mapping = CreateFileMappingW(
-                INVALID_HANDLE,
+                file,
                 std::ptr::null(),
                 PAGE_READWRITE,
                 (VCAM_MAPPING_SIZE >> 32) as u32,
                 (VCAM_MAPPING_SIZE & 0xffff_ffff) as u32,
-                name.as_ptr(),
+                std::ptr::null(),
             );
+            // The mapping keeps the file alive; the handle is done with.
+            CloseHandle(file);
             if mapping == 0 {
                 return None;
             }

@@ -28,15 +28,29 @@ bool FrameReader::open() {
     if (view_) {
         return true;
     }
-    // Opened rather than created: the capture program owns the mapping, and a
-    // reader that created it would paper over the publisher not running with a
-    // block of zeroes that looks like a legitimate black frame.
-    mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, VCAM_MAPPING_NAME);
-    if (!mapping_) {
+    // OPEN_EXISTING rather than OPEN_ALWAYS: the capture program owns this
+    // file, and a reader that created it would paper over the publisher not
+    // running with a block of zeroes indistinguishable from a black frame.
+    // Shared for write too, because the publisher is writing it continuously.
+    HANDLE file = CreateFileW(VCAM_FILE_PATH, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        last_error_ = GetLastError();
         return false;
     }
+
+    mapping_ = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    // The mapping keeps the file alive; the handle is not needed past this.
+    CloseHandle(file);
+    if (!mapping_) {
+        last_error_ = GetLastError();
+        return false;
+    }
+
     view_ = MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, VCAM_MAPPING_SIZE);
     if (!view_) {
+        last_error_ = GetLastError();
         CloseHandle(mapping_);
         mapping_ = nullptr;
         return false;
