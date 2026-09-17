@@ -36,11 +36,18 @@ vcam\build\vcam_host.exe register
 `0x00000000` means machine-wide. `0x00000001` means it fell back to per-user,
 which will not work -- see [Why elevation](#why-elevation).
 
-Then, in three windows:
+Then just run the capture program. It starts `vcam_host` itself, in its own
+window, and the camera comes up with it and goes away with it:
+
+```
+cargo run --release
+```
+
+To drive the pieces separately, which is mostly useful when something is wrong:
 
 ```
 vcam\build\vcam_host.exe run          camera exists while this runs
-set SPCA_VCAM=1 && cargo run --release    capture, publishing frames
+set SPCA_VCAM=0 && cargo run --release    capture without publishing
 vcam\build\vcam_host.exe list         should show it alongside real cameras
 ```
 

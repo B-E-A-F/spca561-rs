@@ -1,14 +1,24 @@
 // Registers the media source and publishes it as a Windows camera.
 //
-//   vcam_host register     write the COM registration (HKCU, no admin)
+//   vcam_host register      write the COM registration -- needs elevation
 //   vcam_host unregister    remove it
 //   vcam_host run           create the virtual camera and hold it open
+//   vcam_host list          enumerate cameras as an application would
+//   vcam_host peek          read the shared frames without the camera
+//   vcam_host grab          open the camera and read frames, end to end
 //
 // The camera exists only while `run` is running. That is deliberate: with
 // MFVirtualCameraLifetime_Session the registration disappears when this exits,
 // so a crash or a reboot cannot leave a dead camera advertised to every
-// application on the machine. It also means no elevation -- Session lifetime
-// and CurrentUser access both stay inside this user's world.
+// application on the machine.
+//
+// Registration is a different matter and does need administrator, because the
+// Frame Server service resolves the class from HKLM and never sees this user's
+// hive. See the README.
+//
+// Normally the capture program starts this itself, in its own window, and asks
+// it to quit on the way out. Quit it with Enter rather than closing the window:
+// a host that does not exit cleanly never removes its camera.
 #include "shared.h"
 
 #include <windows.h>

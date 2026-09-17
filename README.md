@@ -124,6 +124,8 @@ before pressing a key, and makes the thing scriptable:
 | `SPCA_SHOT_AB` | `1` to write each shot through both demosaics |
 | `SPCA_RIFE_MODEL` | Path to the RIFE model, when built with `--features rife` |
 | `SPCA_DIAG` | `1` to report lost frames, stage timings and pipeline latency |
+| `SPCA_VCAM` | `0` to not publish to the virtual camera |
+| `SPCA_VCAM_HOST` | Path to `vcam_host.exe`, if it is not where it is looked for |
 
 If the frame rate sits at `0 fps` while the program is otherwise running, see
 [Troubleshooting](#troubleshooting).
@@ -278,6 +280,47 @@ A refinement not implemented: gain is free in frame-rate terms where exposure
 is not, so preferring gain until it saturates and only then reaching for
 exposure would hold the frame rate longer, at the cost of noise. The kernel
 raises both together and so does this.
+
+### Virtual camera
+
+The capture can also be published as a **real Windows camera**, so it appears
+in Settings > Bluetooth & devices > Cameras and to any application, rather than
+only in this program's preview window. Everything about how that works lives in
+[vcam/README.md](vcam/README.md); this is what it means from here.
+
+Build it once, and register it once from an **elevated** prompt:
+
+```
+vcam\build.cmd
+vcam\build\vcam_host.exe register
+```
+
+Registration has to be machine-wide, so that step genuinely needs
+administrator. It is also the only step that does.
+
+After that there is nothing extra to run:
+
+```
+cargo run --release
+```
+
+The program starts `vcam_host` itself, in its own window, and the camera comes
+up with it and goes away with it. Nothing is published before there is anywhere
+to read frames from, and nothing is left advertised afterwards.
+
+If `vcam/` has never been built, none of this happens and nothing is said about
+it -- wanting only the preview window is a perfectly ordinary thing to want.
+`SPCA_VCAM=0` turns it off when it has been built.
+
+The camera advertises a fixed 352x288 regardless of capture mode, because an
+application picks a media type once and keeps it. Only captured frames are
+published, never interpolated ones: the consumer re-times the stream against
+its own clock, so invented phases would buy nothing and cost latency.
+
+One habit worth keeping: quit `vcam_host` with **Enter**, not by closing its
+window. A host that does not exit cleanly never removes its camera, and the
+registration outlives it. The program does this correctly on your behalf when
+it is the one that started it.
 
 ### Demosaic
 

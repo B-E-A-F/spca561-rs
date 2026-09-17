@@ -658,6 +658,81 @@ extern "system" {
     ) -> isize;
 }
 
+/// The `vcam_host run` process, launched and shut down with us.
+///
+/// It gets its own console window, so its output stays legible instead of
+/// interleaving with the frame rate, but its stdin is a pipe rather than that
+/// console. That is what makes a clean exit possible: the host quits when its
+/// `getchar` returns, so writing a newline asks it to stop, and it removes the
+/// camera on the way out.
+///
+/// Killing it instead would skip that, and the camera registration outlives
+/// the process that made it -- the next run then fails with
+/// MF_E_INVALIDREQUEST for registering a camera the frame server already
+/// believes exists. Terminate is the last resort here, not the first move.
+struct VcamHost {
+    child: std::process::Child,
+}
+
+impl VcamHost {
+    /// Find vcam_host.exe. Beside this executable first, since that is how a
+    /// built copy is laid out, then the source tree, for `cargo run`.
+    fn find() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("SPCA_VCAM_HOST") {
+            let p = std::path::PathBuf::from(p);
+            return p.is_file().then_some(p);
+        }
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("vcam_host.exe"));
+            }
+        }
+        candidates.push(std::path::PathBuf::from("vcam/build/vcam_host.exe"));
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    fn spawn(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::windows::process::CommandExt;
+        /// Its own console: the host's messages about registration and the
+        /// camera are worth reading, and not worth interleaving with ours.
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+        let child = std::process::Command::new(path)
+            .arg("run")
+            .stdin(std::process::Stdio::piped())
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()?;
+        Ok(VcamHost { child })
+    }
+}
+
+impl Drop for VcamHost {
+    fn drop(&mut self) {
+        use std::io::Write;
+        if let Some(stdin) = self.child.stdin.as_mut() {
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+        // Closing the pipe makes the read return even if the write did not
+        // land, so the host is not left waiting on a handle nobody holds.
+        drop(self.child.stdin.take());
+
+        // Give it a moment to take the camera down properly. Half a second is
+        // generous for Stop, Remove and Release; past that something is wrong
+        // and a stale registration is the lesser problem compared to hanging
+        // on exit.
+        for _ in 0..50 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+    }
+}
+
 struct Vcam {
     mapping: isize,
     view: *mut u8,
@@ -1819,22 +1894,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut keys = Keys::new();
     let mut resize = Resize::new();
 
-    // Publishing to the virtual camera is opt-in: it costs a resample and a
-    // copy per captured frame, and is pointless unless vcam_host is running.
-    let mut vcam = if std::env::var("SPCA_VCAM").as_deref() == Ok("1") {
-        match Vcam::new() {
-            Some(v) => {
-                println!("publishing to the virtual camera ({VCAM_PUB_W}x{VCAM_PUB_H})");
-                Some(v)
-            }
-            None => {
-                eprintln!("could not create the virtual camera mapping");
-                None
+    // The virtual camera comes up with the program when vcam_host.exe is
+    // there to run, and stays out of the way when it is not -- an unbuilt
+    // vcam/ is the normal state for anyone who only wants the preview window,
+    // not an error to report at them. SPCA_VCAM=0 turns it off outright.
+    let want_vcam = std::env::var("SPCA_VCAM").as_deref() != Ok("0");
+    let mut vcam_host = None;
+    let mut vcam = None;
+    if want_vcam {
+        if let Some(host) = VcamHost::find() {
+            match Vcam::new() {
+                Some(v) => {
+                    // The mapping first: the host's camera can be opened the
+                    // moment it exists, and a consumer that arrives before
+                    // there is anywhere to read frames from sees black.
+                    vcam = Some(v);
+                    match VcamHost::spawn(&host) {
+                        Ok(h) => {
+                            println!(
+                                "virtual camera: publishing {VCAM_PUB_W}x{VCAM_PUB_H}, \
+                                 host in its own window"
+                            );
+                            vcam_host = Some(h);
+                        }
+                        Err(e) => {
+                            eprintln!("could not start {}: {e}", host.display());
+                            eprintln!("frames are still published; run it by hand to expose them");
+                        }
+                    }
+                }
+                None => eprintln!("could not create the virtual camera mapping"),
             }
         }
-    } else {
-        None
-    };
+    }
+    // Named so it is obvious this is held for its Drop, not forgotten about:
+    // dropping it asks the host to remove the camera.
+    let _vcam_host = vcam_host;
     let mut published_for = u64::MAX;
     // Opt-in timing, for working out where the frame budget actually goes.
     let diag = std::env::var("SPCA_DIAG").as_deref() == Ok("1");
